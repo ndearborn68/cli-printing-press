@@ -1,0 +1,39 @@
+{
+  "manifest_version": "0.3",
+  "name": "findtalent-pp-mcp",
+  "display_name": "Findtalent",
+  "version": "1.0.0",
+  "description": "FindTalent is a candidate-sourcing platform that helps recruiters find qualified candidates.",
+  "author": {
+    "name": "CLI Printing Press"
+  },
+  "license": "Apache-2.0",
+  "server": {
+    "type": "binary",
+    "entry_point": "bin/findtalent-pp-mcp",
+    "mcp_config": {
+      "command": "${__dirname}/bin/findtalent-pp-mcp",
+      "args": [],
+      "env": {
+        "FINDTALENT_BEARER_AUTH": "${user_config.findtalent_bearer_auth}"
+      }
+    }
+  },
+  "user_config": {
+    "findtalent_bearer_auth": {
+      "type": "string",
+      "title": "FINDTALENT_BEARER_AUTH",
+      "description": "Sets FINDTALENT_BEARER_AUTH for the Findtalent MCP server.",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": [
+      "darwin",
+      "linux",
+      "win32"
+    ]
+  }
+}

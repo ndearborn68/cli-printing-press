@@ -1,0 +1,133 @@
+{
+  "api_name": "findtalent",
+  "base_url": "https://www.findtalent.today/api",
+  "description": "FindTalent is a candidate-sourcing platform that helps recruiters find qualified candidates.",
+  "mcp_ready": "full",
+  "http_transport": "standard",
+  "auth": {
+    "type": "bearer_token",
+    "header": "Authorization",
+    "env_vars": [
+      "FINDTALENT_BEARER_AUTH"
+    ],
+    "env_var_specs": [
+      {
+        "name": "FINDTALENT_BEARER_AUTH",
+        "kind": "per_call",
+        "required": true,
+        "sensitive": true,
+        "inferred": true
+      }
+    ]
+  },
+  "required_headers": [],
+  "tools": [
+    {
+      "name": "candidates_export",
+      "description": "Export a list of candidates to CSV or JSON format. The candidate IDs must be provided in the request body. Required: candidateIds, format (default: csv). Optional: fields. Returns array of CandidateProfile.",
+      "method": "POST",
+      "path": "/candidates/export",
+      "params": [
+        {
+          "name": "candidateIds",
+          "type": "string_csv_array",
+          "location": "body",
+          "description": "List of candidate IDs to export",
+          "required": true
+        },
+        {
+          "name": "fields",
+          "type": "string_csv_array",
+          "location": "body",
+          "description": "Specific fields to include in the export. If not specified, all available fields are included."
+        },
+        {
+          "name": "format",
+          "type": "string",
+          "location": "body",
+          "description": "Export format",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "candidates_get",
+      "description": "Retrieve detailed information about a specific candidate by ID. Required: candidateId. Returns the CandidateProfile.",
+      "method": "GET",
+      "path": "/candidates/{candidateId}",
+      "params": [
+        {
+          "name": "candidateId",
+          "type": "string",
+          "location": "path",
+          "description": "Unique identifier for the candidate",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "candidates_search",
+      "description": "Search for candidates based on criteria like job title, company, location, and keywords. Returns a list of candidate profiles with basic information. Optional: company, keywords, limit (default: 20) (plus 4 more).",
+      "method": "POST",
+      "path": "/candidates/search",
+      "params": [
+        {
+          "name": "company",
+          "type": "string",
+          "location": "body",
+          "description": "Filter by company name"
+        },
+        {
+          "name": "keywords",
+          "type": "string_csv_array",
+          "location": "body",
+          "description": "Additional keywords to filter by"
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "location": "body",
+          "description": "Number of results to return"
+        },
+        {
+          "name": "location",
+          "type": "string",
+          "location": "body",
+          "description": "Filter by location (city, state, or country)"
+        },
+        {
+          "name": "offset",
+          "type": "int",
+          "location": "body",
+          "description": "Offset for pagination"
+        },
+        {
+          "name": "query",
+          "type": "string",
+          "location": "body",
+          "description": "Search query string"
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "location": "body",
+          "description": "Filter by job title"
+        }
+      ]
+    },
+    {
+      "name": "findtalent-search_get-history",
+      "description": "Retrieve the user's recent search history. Optional: limit (default: 20). Returns array of SearchHistoryEntry.",
+      "method": "GET",
+      "path": "/search/history",
+      "params": [
+        {
+          "name": "limit",
+          "type": "int",
+          "location": "query",
+          "description": "Number of history entries to return"
+        }
+      ]
+    }
+  ]
+}

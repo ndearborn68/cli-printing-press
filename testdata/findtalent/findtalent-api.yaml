@@ -1,0 +1,435 @@
+openapi: 3.0.3
+info:
+  title: FindTalent API
+  description: |-
+    FindTalent is a candidate-sourcing platform that helps recruiters find qualified candidates.
+    This API provides access to candidate search, profile retrieval, and export functionality.
+    
+    Authentication is handled via a session cookie or bearer token obtained from the FindTalent web application.
+  version: 1.0.0
+  contact:
+    name: FindTalent
+    url: https://www.findtalent.today/
+  x-auth-instructions: "Sign in at https://www.findtalent.today/sign-in and copy your session cookie or token"
+
+servers:
+  - url: https://www.findtalent.today/api
+    description: Production API
+
+security:
+  - sessionAuth: []
+  - bearerAuth: []
+
+paths:
+  /candidates/search:
+    post:
+      summary: Search for candidates
+      description: |-
+        Search for candidates based on criteria like job title, company, location, and keywords.
+        Returns a list of candidate profiles with basic information.
+      operationId: searchCandidates
+      tags:
+        - Candidates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                  description: Search query string
+                  example: "Senior Software Engineer"
+                title:
+                  type: string
+                  description: Filter by job title
+                  example: "Software Engineer"
+                company:
+                  type: string
+                  description: Filter by company name
+                  example: "Google"
+                location:
+                  type: string
+                  description: Filter by location (city, state, or country)
+                  example: "San Francisco, CA"
+                keywords:
+                  type: array
+                  items:
+                    type: string
+                  description: Additional keywords to filter by
+                  example: ["Python", "AWS", "React"]
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  default: 20
+                  description: Number of results to return
+                offset:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                  description: Offset for pagination
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CandidateSummary'
+                  total:
+                    type: integer
+                    description: Total number of matching candidates
+                  limit:
+                    type: integer
+                  offset:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST https://www.findtalent.today/api/candidates/search \
+              -H "Authorization: Bearer YOUR_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"title": "Software Engineer", "location": "San Francisco, CA", "limit": 20}'
+
+  /candidates/{candidateId}:
+    get:
+      summary: Get candidate profile
+      description: Retrieve detailed information about a specific candidate by ID
+      operationId: getCandidate
+      tags:
+        - Candidates
+      parameters:
+        - name: candidateId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Unique identifier for the candidate
+          example: "cand_abc123xyz"
+      responses:
+        '200':
+          description: Candidate profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidateProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Candidate not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /candidates/export:
+    post:
+      summary: Export candidates
+      description: |-
+        Export a list of candidates to CSV or JSON format.
+        The candidate IDs must be provided in the request body.
+      operationId: exportCandidates
+      tags:
+        - Candidates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - candidateIds
+                - format
+              properties:
+                candidateIds:
+                  type: array
+                  items:
+                    type: string
+                  description: List of candidate IDs to export
+                  minItems: 1
+                  maxItems: 1000
+                  example: ["cand_abc123", "cand_def456"]
+                format:
+                  type: string
+                  enum: [csv, json]
+                  description: Export format
+                  default: csv
+                fields:
+                  type: array
+                  items:
+                    type: string
+                  description: |-
+                    Specific fields to include in the export.
+                    If not specified, all available fields are included.
+                  example: ["name", "email", "title", "company", "location"]
+      responses:
+        '200':
+          description: Export file
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CandidateProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /search/history:
+    get:
+      summary: Get search history
+      description: Retrieve the user's recent search history
+      operationId: getSearchHistory
+      tags:
+        - Search
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Number of history entries to return
+      responses:
+        '200':
+          description: Search history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  searches:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SearchHistoryEntry'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    sessionAuth:
+      type: apiKey
+      in: cookie
+      name: findtalent_session
+      description: Session cookie obtained after signing in to FindTalent
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer token for API authentication
+
+  schemas:
+    CandidateSummary:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Unique candidate identifier
+          example: "cand_abc123xyz"
+        name:
+          type: string
+          description: Candidate's full name
+          example: "Jane Smith"
+        title:
+          type: string
+          description: Current or most recent job title
+          example: "Senior Software Engineer"
+        company:
+          type: string
+          description: Current or most recent company
+          example: "Google"
+        location:
+          type: string
+          description: Candidate's location
+          example: "San Francisco, CA"
+        summary:
+          type: string
+          description: Brief professional summary
+          example: "10+ years building scalable distributed systems"
+        matchScore:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Relevance score for the search query (0-1)
+          example: 0.87
+
+    CandidateProfile:
+      allOf:
+        - $ref: '#/components/schemas/CandidateSummary'
+        - type: object
+          properties:
+            email:
+              type: string
+              format: email
+              description: Candidate's email address
+              example: "jane.smith@example.com"
+            phone:
+              type: string
+              description: Candidate's phone number
+              example: "+1 (555) 123-4567"
+            linkedin:
+              type: string
+              format: uri
+              description: LinkedIn profile URL
+              example: "https://www.linkedin.com/in/janesmith"
+            github:
+              type: string
+              format: uri
+              description: GitHub profile URL
+              example: "https://github.com/janesmith"
+            skills:
+              type: array
+              items:
+                type: string
+              description: List of skills
+              example: ["Python", "Go", "AWS", "Kubernetes", "React"]
+            experience:
+              type: array
+              items:
+                $ref: '#/components/schemas/WorkExperience'
+            education:
+              type: array
+              items:
+                $ref: '#/components/schemas/Education'
+            bio:
+              type: string
+              description: Detailed professional biography
+              example: "Experienced software engineer with a passion for building scalable systems..."
+
+    WorkExperience:
+      type: object
+      properties:
+        title:
+          type: string
+          description: Job title
+          example: "Senior Software Engineer"
+        company:
+          type: string
+          description: Company name
+          example: "Google"
+        location:
+          type: string
+          description: Job location
+          example: "Mountain View, CA"
+        startDate:
+          type: string
+          format: date
+          description: Start date
+          example: "2020-01-15"
+        endDate:
+          type: string
+          format: date
+          nullable: true
+          description: End date (null if current position)
+          example: "2023-06-30"
+        description:
+          type: string
+          description: Job description and responsibilities
+          example: "Led development of distributed data pipeline processing 10TB/day"
+
+    Education:
+      type: object
+      properties:
+        school:
+          type: string
+          description: Educational institution
+          example: "Stanford University"
+        degree:
+          type: string
+          description: Degree obtained
+          example: "B.S. Computer Science"
+        field:
+          type: string
+          description: Field of study
+          example: "Computer Science"
+        startDate:
+          type: string
+          format: date
+          description: Start date
+          example: "2012-09-01"
+        endDate:
+          type: string
+          format: date
+          description: End date
+          example: "2016-06-15"
+
+    SearchHistoryEntry:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Search entry identifier
+        query:
+          type: object
+          description: The search query parameters
+        timestamp:
+          type: string
+          format: date-time
+          description: When the search was performed
+        resultCount:
+          type: integer
+          description: Number of results returned
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: "Invalid request"
+        code:
+          type: string
+          description: Error code
+          example: "invalid_request"
+        details:
+          type: object
+          description: Additional error details
+
+  responses:
+    Unauthorized:
+      description: Unauthorized - invalid or missing authentication
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Unauthorized"
+            code: "unauthorized"
+            details:
+              message: "Valid session cookie or bearer token required"
+    
+    RateLimited:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Rate limit exceeded"
+            code: "rate_limited"
+            details:
+              retryAfter: 60
+
+tags:
+  - name: Candidates
+    description: Operations for searching and retrieving candidate information
+  - name: Search
+    description: Search-related operations
