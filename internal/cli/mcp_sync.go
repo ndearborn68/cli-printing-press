@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/pipeline/mcpsync"
+	"github.com/mvanhorn/cli-printing-press/v4/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -28,6 +29,12 @@ a usable brand name.`,
 			cliDir, err := filepath.Abs(args[0])
 			if err != nil {
 				return &ExitError{Code: ExitInputError, Err: fmt.Errorf("resolving cli dir: %w", err)}
+			}
+			if err := ensureNotOlderThanCLIManifest(cliDir, "mcp-sync"); err != nil {
+				return &ExitError{Code: ExitInputError, Err: err}
+			}
+			if err := ensureMCPVersionCompatibleWithCLIManifest(cliDir, version.Get()); err != nil {
+				return &ExitError{Code: ExitInputError, Err: err}
 			}
 			result, err := mcpsync.Sync(cliDir, mcpsync.Options{Force: force})
 			if err != nil {

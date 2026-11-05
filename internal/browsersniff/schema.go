@@ -65,23 +65,16 @@ func InferRequestSchema(body string, contentType string) []spec.Param {
 		return nil
 	}
 
-	contentType = strings.ToLower(contentType)
-	switch {
-	case strings.Contains(contentType, "json"):
-		var value any
-		if err := json.Unmarshal([]byte(body), &value); err != nil {
-			return nil
-		}
-
-		root := topLevelObject(value)
-		if root == nil {
-			return nil
-		}
-
+	// Payload syntax wins over the advertised media type. A valid JSON object
+	// sent as application/x-www-form-urlencoded is still JSON fields, not one
+	// form-field name equal to the raw document.
+	if root, ok := parseJSONRequestObject(body); ok {
 		fields := make(map[string]*inferredField)
 		mergeObject(fields, root, 1)
 		return buildParams(fields, 1)
-	case strings.Contains(contentType, "form-urlencoded"):
+	}
+
+	if strings.Contains(strings.ToLower(contentType), "form-urlencoded") {
 		values := ParseFormBody(body)
 		if len(values) == 0 {
 			return nil
@@ -93,6 +86,7 @@ func InferRequestSchema(body string, contentType string) []spec.Param {
 				Name:        key,
 				Type:        inferScalarStringType(value),
 				Required:    true,
+				Default:     value,
 				Description: "",
 			})
 		}
@@ -101,9 +95,25 @@ func InferRequestSchema(body string, contentType string) []spec.Param {
 			return params[i].Name < params[j].Name
 		})
 		return params
-	default:
-		return nil
 	}
+
+	return nil
+}
+
+func parseJSONRequestObject(body string) (map[string]any, bool) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil, false
+	}
+	var value any
+	if err := json.Unmarshal([]byte(body), &value); err != nil {
+		return nil, false
+	}
+	root := topLevelObject(value)
+	if root == nil {
+		return nil, false
+	}
+	return root, true
 }
 
 func ParseFormBody(body string) map[string]string {
@@ -158,17 +168,28 @@ func mergeObject(fields map[string]*inferredField, object map[string]any, depth 
 		field.count++
 		field.param = inferParam(name, value, depth)
 
-		if field.param.Type == "object" && len(field.param.Fields) > 0 {
+		if (field.param.Type == "object" || field.param.Type == "array") && len(field.param.Fields) > 0 {
 			if field.nested == nil {
 				field.nested = make(map[string]*inferredField)
 			}
 
-			child, ok := value.(map[string]any)
-			if ok {
+			if child, ok := nestedObjectSample(value); ok {
 				mergeObject(field.nested, child, depth+1)
 			}
 		}
 	}
+}
+
+func nestedObjectSample(value any) (map[string]any, bool) {
+	if child, ok := value.(map[string]any); ok {
+		return child, true
+	}
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return nil, false
+	}
+	child, ok := items[0].(map[string]any)
+	return child, ok
 }
 
 func inferParam(name string, value any, depth int) spec.Param {
@@ -236,7 +257,7 @@ func buildParams(fields map[string]*inferredField, sampleCount int) []spec.Param
 		param := field.param
 		param.Name = name
 		param.Required = field.count == sampleCount
-		if field.param.Type == "object" && field.nested != nil {
+		if (field.param.Type == "object" || field.param.Type == "array") && field.nested != nil {
 			param.Fields = buildParams(field.nested, field.count)
 		}
 		params = append(params, param)

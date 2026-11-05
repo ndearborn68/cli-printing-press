@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/artifacts"
@@ -31,16 +30,18 @@ func runStructuralVerify(cfg VerifyConfig) (*VerifyReport, error) {
 	}
 	report.Binary = binaryPath
 
-	commands := discoverCommands(cfg.Dir, binaryPath)
+	// No mock server in structural verify. Stay on the scoped ambient env;
+	// PRINTING_PRESS_VERIFY would change which commands actually run.
+	commands := discoverCommands(cfg.Dir, binaryPath, subprocessEnv())
 
 	for _, cmd := range commands {
 		result := runStructuralCommandTests(binaryPath, cmd)
 		report.Results = append(report.Results, result)
 	}
 
-	versionOK := runCLI(binaryPath, []string{"version"}, os.Environ(), 10*time.Second) == nil
+	versionOK := runCLI(binaryPath, []string{"version"}, subprocessEnv(), 10*time.Second) == nil
 	if !versionOK {
-		versionOK = runCLI(binaryPath, []string{"--version"}, os.Environ(), 10*time.Second) == nil
+		versionOK = runCLI(binaryPath, []string{"--version"}, subprocessEnv(), 10*time.Second) == nil
 	}
 	report.DataPipeline = versionOK
 	if versionOK {
@@ -49,6 +50,7 @@ func runStructuralVerify(cfg VerifyConfig) (*VerifyReport, error) {
 		report.DataPipelineDetail = "FAIL (version command)"
 	}
 	report.Freshness = runFreshnessContractTest(cfg.Dir)
+	report.PathParamProbes = runPathParamProbes(binaryPath, subprocessEnv(), nil)
 
 	finalizeVerifyReport(report, cfg.Threshold, false)
 
@@ -63,14 +65,14 @@ func runStructuralCommandTests(binary string, cmd discoveredCommand) CommandResu
 		Kind:    "structural",
 	}
 
-	result.Help = runCLI(binary, []string{cmd.Name, "--help"}, os.Environ(), 10*time.Second) == nil
-	result.DryRun = runCLI(binary, []string{cmd.Name, "--help", "--json"}, os.Environ(), 10*time.Second) == nil
+	result.Help = runCLI(binary, []string{cmd.Name, "--help"}, subprocessEnv(), 10*time.Second) == nil
+	result.DryRun = runCLI(binary, []string{cmd.Name, "--help", "--json"}, subprocessEnv(), 10*time.Second) == nil
 
 	switch cmd.Name {
 	case "doctor", "version", "auth", "completion", "api", "help":
 		result.Execute = true // these work without args
 	default:
-		err := runCLI(binary, []string{cmd.Name, "--json"}, os.Environ(), 10*time.Second)
+		err := runCLI(binary, []string{cmd.Name, "--json"}, subprocessEnv(), 10*time.Second)
 		result.Execute = true
 		_ = err
 	}

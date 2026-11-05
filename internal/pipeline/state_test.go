@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -59,6 +60,27 @@ func TestStateRoundTrip(t *testing.T) {
 	assert.Equal(t, PlanStatusSeed, loaded.Phases[PhaseScaffold].PlanStatus)
 	assert.Equal(t, StatusPending, loaded.Phases[PhaseEnrich].Status)
 	assert.Empty(t, loaded.Phases[PhaseEnrich].PlanStatus)
+}
+
+func TestStateRoundTripPreservesReceiptRecoveryFields(t *testing.T) {
+	setPressTestEnv(t)
+	s := NewState("receipt-fields", "/tmp/receipt-cli")
+	s.PhaseReceiptLog = filepath.Join(s.PipelineDir(), "phase-receipts.jsonl")
+	s.PrintingPressBin = "/opt/press/cli-printing-press"
+	require.NoError(t, s.Save())
+	defer os.RemoveAll(RunRoot(s.RunID))
+
+	loaded, err := LoadState("receipt-fields")
+	require.NoError(t, err)
+	assert.Equal(t, s.PhaseReceiptLog, loaded.PhaseReceiptLog)
+	assert.Equal(t, s.PrintingPressBin, loaded.PrintingPressBin)
+
+	loaded.WorkingDir = "/tmp/promoted-cli"
+	require.NoError(t, loaded.Save())
+	reloaded, err := LoadState("receipt-fields")
+	require.NoError(t, err)
+	assert.Equal(t, s.PhaseReceiptLog, reloaded.PhaseReceiptLog)
+	assert.Equal(t, s.PrintingPressBin, reloaded.PrintingPressBin)
 }
 
 func TestNextPhase(t *testing.T) {
@@ -291,4 +313,55 @@ func TestResolveStatePathPrefersLegacyOverExcludedRunstateScratch(t *testing.T) 
 	require.NoError(t, err)
 	assert.Equal(t, "/tmp/legacy-cli", loaded.OutputDir)
 	assert.NotEqual(t, "run-scratch", loaded.RunID)
+}
+
+func TestLoadStateHandlesNullPhases(t *testing.T) {
+	cases := []struct {
+		name    string
+		version int
+	}{
+		{"old-version triggers migration backfill", 0},
+		{"current-version skips migration loop", currentStateVersion},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setPressTestEnv(t)
+			apiName := "nil-phases-test"
+			dir := PipelineDir(apiName)
+			require.NoError(t, os.MkdirAll(dir, 0o755))
+
+			raw := fmt.Appendf(nil, `{
+  "version": %d,
+  "api_name": "%s",
+  "output_dir": "/tmp/nil-phases-cli",
+  "working_dir": "/tmp/nil-phases-cli",
+  "phases": null
+}`, tc.version, apiName)
+			require.NoError(t, os.WriteFile(StatePath(apiName), raw, 0o644))
+
+			loaded, err := LoadState(apiName)
+			require.NoError(t, err)
+			require.NotNil(t, loaded.Phases)
+		})
+	}
+}
+
+func TestSavePersistsEmptyPhasesAsObject(t *testing.T) {
+	setPressTestEnv(t)
+	apiName := "save-nil-phases-test"
+
+	state := &PipelineState{
+		Version:    currentStateVersion,
+		APIName:    apiName,
+		RunID:      "run-save-nil",
+		Scope:      "test-scope",
+		OutputDir:  "/tmp/save-nil-cli",
+		WorkingDir: "/tmp/save-nil-cli",
+	}
+	require.NoError(t, state.Save())
+
+	data, err := os.ReadFile(state.StatePath())
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), `"phases": null`)
+	assert.Contains(t, string(data), `"phases":`)
 }

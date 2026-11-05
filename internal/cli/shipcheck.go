@@ -11,12 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mvanhorn/cli-printing-press/v4/internal/pipeline"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/platform"
 	"github.com/spf13/cobra"
 )
 
 // shipcheck is the canonical Phase 4 verification umbrella. It runs each
-// of the six legs as a subprocess of the same printing-press binary,
+// leg as a subprocess of the same printing-press binary,
 // aggregates exit codes, and prints a per-leg summary. Legs remain
 // callable standalone — this command is purely additive orchestration.
 //
@@ -39,9 +40,10 @@ import (
 // opt-outs exist so an operator can ask for a quick read-only sweep
 // without verify auto-repairing source or scorecard sampling live calls.
 type shipcheckOpts struct {
-	dir         string
-	spec        string
-	researchDir string
+	dir          string
+	spec         string
+	researchDir  string
+	verifyNoSpec bool
 
 	// JSON envelope output. When set, suppresses the human summary table
 	// and emits a structured envelope at end-of-run instead. Each leg's
@@ -50,11 +52,17 @@ type shipcheckOpts struct {
 	asJSON bool
 
 	// Per-leg pass-through flags.
-	noFix       bool   // when true, omit --fix from verify argv
-	noLiveCheck bool   // when true, omit --live-check from scorecard argv
-	apiKey      string // when set, pass --api-key to verify
-	envVar      string // when set, pass --env-var to verify
-	strict      bool   // when set, pass --strict to verify-skill
+	// fix is the explicit opt-in that still runs verify --fix after a
+	// valid phase5 acceptance marker matches this tree. noFix forces a
+	// read-only verify. Neither flag set keeps today's default (verify
+	// --fix) unless that marker matches, in which case verify is read-only.
+	fix              bool
+	noFix            bool   // when true, omit --fix from verify argv
+	noLiveCheck      bool   // when true, omit --live-check from scorecard argv
+	apiKey           string // when set, pass --api-key to verify
+	envVar           string // when set, pass --env-var to verify
+	strict           bool   // when set, pass --strict to verify-skill
+	allowDestructive bool   // when set, allow non-dogfood legs to execute live mutations
 }
 
 // shipcheckLeg names one verification leg and how to invoke it.
@@ -65,29 +73,18 @@ type shipcheckLeg struct {
 	args func(*shipcheckOpts) []string
 }
 
-// shipcheckLegs enumerates the six legs in canonical execution order.
-// Order matters: dogfood writes research.json updates that scorecard
-// later consumes, verify builds the CLI binary validate-narrative uses,
-// and scorecard should see all earlier validation failures first.
+// shipcheckLegs enumerates the legs in canonical execution order.
+// Order matters: verify builds the binary; validate-narrative checks
+// research.json command paths against the binary BEFORE dogfood synthesizes
+// README/SKILL from those commands.
 var shipcheckLegs = []shipcheckLeg{
-	{
-		name: "dogfood",
-		args: func(o *shipcheckOpts) []string {
-			a := []string{"dogfood", "--dir", o.dir}
-			if o.spec != "" {
-				a = append(a, "--spec", o.spec)
-			}
-			if o.researchDir != "" {
-				a = append(a, "--research-dir", o.researchDir)
-			}
-			return a
-		},
-	},
 	{
 		name: "verify",
 		args: func(o *shipcheckOpts) []string {
-			a := []string{"verify", "--dir", o.dir}
-			if o.spec != "" {
+			a := []string{"verify", "--dir", o.dir, "--write-manifest", shipcheckManifestPath(o)}
+			if o.verifyNoSpec && o.spec != "" {
+				a = append(a, "--no-spec")
+			} else if o.spec != "" {
 				a = append(a, "--spec", o.spec)
 			}
 			if !o.noFix {
@@ -99,21 +96,8 @@ var shipcheckLegs = []shipcheckLeg{
 			if o.envVar != "" {
 				a = append(a, "--env-var", o.envVar)
 			}
-			return a
-		},
-	},
-	{
-		name: "workflow-verify",
-		args: func(o *shipcheckOpts) []string {
-			return []string{"workflow-verify", "--dir", o.dir}
-		},
-	},
-	{
-		name: "verify-skill",
-		args: func(o *shipcheckOpts) []string {
-			a := []string{"verify-skill", "--dir", o.dir}
-			if o.strict {
-				a = append(a, "--strict")
+			if o.allowDestructive {
+				a = append(a, "--allow-destructive")
 			}
 			return a
 		},
@@ -131,9 +115,48 @@ var shipcheckLegs = []shipcheckLeg{
 		},
 	},
 	{
+		name: "dogfood",
+		args: func(o *shipcheckOpts) []string {
+			a := []string{"dogfood", "--dir", o.dir}
+			if o.spec != "" {
+				a = append(a, "--spec", o.spec)
+			}
+			if o.researchDir != "" {
+				a = append(a, "--research-dir", o.researchDir)
+			}
+			return a
+		},
+	},
+	{
+		name: "workflow-verify",
+		args: func(o *shipcheckOpts) []string {
+			return []string{"workflow-verify", "--dir", o.dir}
+		},
+	},
+	{
+		name: "apify-audit",
+		args: func(o *shipcheckOpts) []string {
+			a := []string{"apify-audit", "--dir", o.dir}
+			if o.researchDir != "" {
+				a = append(a, "--research-dir", o.researchDir)
+			}
+			return a
+		},
+	},
+	{
+		name: "verify-skill",
+		args: func(o *shipcheckOpts) []string {
+			a := []string{"verify-skill", "--dir", o.dir}
+			if o.strict {
+				a = append(a, "--strict")
+			}
+			return a
+		},
+	},
+	{
 		name: "scorecard",
 		args: func(o *shipcheckOpts) []string {
-			a := []string{"scorecard", "--dir", o.dir}
+			a := []string{"scorecard", "--dir", o.dir, "--write-manifest", shipcheckManifestPath(o)}
 			if o.researchDir != "" {
 				a = append(a, "--research-dir", o.researchDir)
 			}
@@ -143,9 +166,16 @@ var shipcheckLegs = []shipcheckLeg{
 			if !o.noLiveCheck {
 				a = append(a, "--live-check")
 			}
+			if o.allowDestructive {
+				a = append(a, "--allow-destructive")
+			}
 			return a
 		},
 	},
+}
+
+func shipcheckManifestPath(o *shipcheckOpts) string {
+	return filepath.Join(o.dir, pipeline.CLIManifestFilename)
 }
 
 func shipcheckResearchPath(o *shipcheckOpts) string {
@@ -156,25 +186,70 @@ func shipcheckResearchPath(o *shipcheckOpts) string {
 	return filepath.Join(dir, "research.json")
 }
 
+// shipcheckBinaryName resolves the CLI binary name for a generated CLI directory.
+// Prefers .printing-press.json's cli_name (the canonical "<api-slug>-pp-cli" form)
+// and falls back to the directory's basename for legacy/manifest-less dirs.
+func shipcheckBinaryName(dir string) string {
+	if name := pipeline.ReadCLIBinaryName(dir); name != "" {
+		return name
+	}
+	return filepath.Base(dir)
+}
+
 func shipcheckCLIPath(o *shipcheckOpts) string {
-	return platform.ExecutablePath(filepath.Join(o.dir, filepath.Base(o.dir)))
+	if path, err := pipeline.ResolveScorerBinaryPath(o.dir, ""); err == nil {
+		return path
+	}
+	return platform.ExecutablePath(filepath.Join(o.dir, shipcheckBinaryName(o.dir)))
 }
 
 func shipcheckCLIPathForGOOS(o *shipcheckOpts, goos string) string {
-	return platform.ExecutablePathForGOOS(filepath.Join(o.dir, filepath.Base(o.dir)), goos)
+	if path, err := pipeline.ResolveScorerBinaryPathForGOOS(o.dir, "", goos); err == nil {
+		return path
+	}
+	return platform.ExecutablePathForGOOS(filepath.Join(o.dir, shipcheckBinaryName(o.dir)), goos)
+}
+
+const shipcheckHTMLSyncStubMarker = "generic spec-driven sync template does not fit predominantly HTML page-mode endpoints"
+
+func shipcheckShouldVerifyNoSpec(dir string) bool {
+	data, err := os.ReadFile(filepath.Join(dir, "internal", "cli", "sync.go"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), shipcheckHTMLSyncStubMarker)
 }
 
 // shipcheckLegResult is the per-leg outcome of one umbrella run.
 type shipcheckLegResult struct {
-	Name      string
-	Argv      []string
-	ExitCode  int
-	StartedAt time.Time
-	Elapsed   time.Duration
+	Name       string
+	Argv       []string
+	ExitCode   int
+	Unverified bool
+	Detail     string
+	StartedAt  time.Time
+	Elapsed    time.Duration
 }
 
 // Passed reports whether the leg exited 0.
-func (r shipcheckLegResult) Passed() bool { return r.ExitCode == 0 }
+func (r shipcheckLegResult) Passed() bool { return r.EffectiveExitCode() == 0 }
+
+func (r shipcheckLegResult) EffectiveExitCode() int {
+	if r.Unverified && r.ExitCode == 0 {
+		return ExitGenerationError
+	}
+	return r.ExitCode
+}
+
+func (r shipcheckLegResult) Verdict() string {
+	if r.Unverified && r.ExitCode == 0 {
+		return "HOLD"
+	}
+	if r.Passed() {
+		return "PASS"
+	}
+	return "FAIL"
+}
 
 // resolveSelfBinary returns the path to the currently-running
 // printing-press binary so the umbrella can spawn itself for each leg.
@@ -256,26 +331,30 @@ func renderShipcheckSummary(w *os.File, results []shipcheckLegResult) {
 	fmt.Fprintln(w, "=================")
 	fmt.Fprintf(w, "  %-16s  %-6s  %-8s  %s\n", "LEG", "RESULT", "EXIT", "ELAPSED")
 	for _, r := range results {
-		verdict := "PASS"
-		if !r.Passed() {
-			verdict = "FAIL"
-		}
 		fmt.Fprintf(w, "  %-16s  %-6s  %-8d  %s\n",
 			r.Name,
-			verdict,
-			r.ExitCode,
+			r.Verdict(),
+			r.EffectiveExitCode(),
 			r.Elapsed.Round(time.Millisecond),
 		)
+		if r.Unverified && r.Detail != "" {
+			fmt.Fprintf(w, "    %s: %s\n", strings.ToLower(r.Verdict()), r.Detail)
+		}
 	}
 	failing := 0
+	holds := 0
 	for _, r := range results {
-		if !r.Passed() {
+		if r.Unverified && r.ExitCode == 0 {
+			holds++
+		} else if !r.Passed() {
 			failing++
 		}
 	}
 	fmt.Fprintln(w, "")
-	if failing == 0 {
+	if failing == 0 && holds == 0 {
 		fmt.Fprintf(w, "Verdict: PASS (%d/%d legs passed)\n", len(results), len(results))
+	} else if failing == 0 {
+		fmt.Fprintf(w, "Verdict: HOLD (unverified: %d/%d legs)\n", holds, len(results))
 	} else {
 		fmt.Fprintf(w, "Verdict: FAIL (%d/%d legs failed)\n", failing, len(results))
 	}
@@ -287,11 +366,73 @@ func renderShipcheckSummary(w *os.File, results []shipcheckLegResult) {
 func shipcheckUmbrellaCode(results []shipcheckLegResult) int {
 	max := 0
 	for _, r := range results {
-		if r.ExitCode > max {
-			max = r.ExitCode
+		if code := r.EffectiveExitCode(); code > max {
+			max = code
 		}
 	}
 	return max
+}
+
+func shipcheckFailureCount(results []shipcheckLegResult) int {
+	count := 0
+	for _, result := range results {
+		if result.ExitCode != 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func shipcheckHoldReason(results []shipcheckLegResult) string {
+	for _, result := range results {
+		if result.Unverified && result.Detail != "" {
+			return result.Detail
+		}
+	}
+	return ""
+}
+
+func markShipcheckScorecardHold(results []shipcheckLegResult, detail string) {
+	for i := range results {
+		if results[i].Name == "scorecard" && results[i].ExitCode == 0 {
+			results[i].Unverified = true
+			results[i].Detail = detail
+			return
+		}
+	}
+}
+
+func applyShipcheckScorecardHold(results []shipcheckLegResult, dir string) {
+	manifest, err := pipeline.ReadCLIManifest(dir)
+	if err != nil {
+		markShipcheckScorecardHold(results, "scorecard hold: manifest evidence unavailable")
+		return
+	}
+	if manifest.Scorecard == nil {
+		markShipcheckScorecardHold(results, "scorecard hold: unverified dimensions were not persisted")
+		return
+	}
+	if len(manifest.Scorecard.UnverifiedDimensions) == 0 {
+		return
+	}
+	// Only evidence-bearing API dimensions should hold shipping. Optional
+	// scorecard dimensions can be legitimately N/A without blocking a CLI.
+	relevant := map[string]bool{
+		pipeline.DimPathValidity:        true,
+		pipeline.DimAuthProtocol:        true,
+		pipeline.DimLiveAPIVerification: true,
+	}
+	var dimensions []string
+	for _, dimension := range manifest.Scorecard.UnverifiedDimensions {
+		if relevant[dimension] {
+			dimensions = append(dimensions, dimension)
+		}
+	}
+	if len(dimensions) == 0 {
+		return
+	}
+	reason := fmt.Sprintf("scorecard hold: unverified dimensions: %s", strings.Join(dimensions, ", "))
+	markShipcheckScorecardHold(results, reason)
 }
 
 // shipcheckJSONLeg is one entry in the JSON envelope's legs[] array.
@@ -301,6 +442,8 @@ type shipcheckJSONLeg struct {
 	Name      string `json:"name"`
 	ExitCode  int    `json:"exit_code"`
 	Passed    bool   `json:"passed"`
+	Verdict   string `json:"verdict"`
+	Detail    string `json:"detail,omitempty"`
 	StartedAt string `json:"started_at"`
 	ElapsedMS int64  `json:"elapsed_ms"`
 	Command   string `json:"command"`
@@ -312,18 +455,29 @@ type shipcheckJSONLeg struct {
 type shipcheckJSONEnvelope struct {
 	Passed    bool               `json:"passed"`
 	ExitCode  int                `json:"exit_code"`
+	Verdict   string             `json:"verdict"`
+	Reason    string             `json:"reason,omitempty"`
 	StartedAt string             `json:"started_at"`
 	ElapsedMS int64              `json:"elapsed_ms"`
 	Legs      []shipcheckJSONLeg `json:"legs"`
 }
 
 // renderShipcheckJSON marshals the envelope to w. Each leg's `command`
-// field shows the full argv as it would be invoked at the shell so an
-// operator can copy-paste-rerun a specific leg from the JSON output.
+// field shows the argv used for that leg with sensitive flag values redacted.
 func renderShipcheckJSON(w *os.File, binPath string, results []shipcheckLegResult, runStartedAt time.Time, runElapsed time.Duration) error {
+	exitCode := shipcheckUmbrellaCode(results)
+	verdict := "PASS"
+	if exitCode != 0 {
+		verdict = "FAIL"
+		if reason := shipcheckHoldReason(results); reason != "" && shipcheckFailureCount(results) == 0 {
+			verdict = "HOLD"
+		}
+	}
 	env := shipcheckJSONEnvelope{
-		Passed:    shipcheckUmbrellaCode(results) == 0,
-		ExitCode:  shipcheckUmbrellaCode(results),
+		Passed:    exitCode == 0,
+		ExitCode:  exitCode,
+		Verdict:   verdict,
+		Reason:    shipcheckHoldReason(results),
 		StartedAt: runStartedAt.UTC().Format(time.RFC3339),
 		ElapsedMS: runElapsed.Milliseconds(),
 		Legs:      make([]shipcheckJSONLeg, 0, len(results)),
@@ -331,16 +485,36 @@ func renderShipcheckJSON(w *os.File, binPath string, results []shipcheckLegResul
 	for _, r := range results {
 		env.Legs = append(env.Legs, shipcheckJSONLeg{
 			Name:      r.Name,
-			ExitCode:  r.ExitCode,
+			ExitCode:  r.EffectiveExitCode(),
 			Passed:    r.Passed(),
+			Verdict:   r.Verdict(),
+			Detail:    r.Detail,
 			StartedAt: r.StartedAt.UTC().Format(time.RFC3339),
 			ElapsedMS: r.Elapsed.Milliseconds(),
-			Command:   strings.Join(append([]string{binPath}, r.Argv...), " "),
+			Command:   renderShipcheckCommand(binPath, r.Argv),
 		})
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(env)
+}
+
+func renderShipcheckCommand(binPath string, argv []string) string {
+	args := append([]string{binPath}, redactShipcheckCommandArgv(argv)...)
+	return strings.Join(args, " ")
+}
+
+func redactShipcheckCommandArgv(argv []string) []string {
+	redacted := make([]string, len(argv))
+	copy(redacted, argv)
+	for i, arg := range redacted {
+		if arg == "--api-key" {
+			if i+1 < len(redacted) {
+				redacted[i+1] = "<redacted>"
+			}
+		}
+	}
+	return redacted
 }
 
 // validateShipcheckDir confirms --dir points at something that looks
@@ -364,22 +538,83 @@ func validateShipcheckDir(dir string) error {
 	return nil
 }
 
+// applyShipcheckVerifyFixPolicy decides whether verify receives --fix.
+// A passing phase5 acceptance marker is bound to the source fingerprint
+// (pipeline.ValidatePhase5Gate). verify --fix rewrites that source and
+// forces a full re-mint, so the default verify leg stays read-only until
+// the operator opts in. Missing, stale, unreadable, and corrupt markers
+// keep today's --fix default and never fail the umbrella.
+func applyShipcheckVerifyFixPolicy(cmd *cobra.Command, opts *shipcheckOpts) error {
+	fixChanged := cmd.Flags().Changed("fix")
+	noFixChanged := cmd.Flags().Changed("no-fix")
+	if fixChanged && noFixChanged {
+		return fmt.Errorf("--fix and --no-fix cannot be combined")
+	}
+
+	match, matched := shipcheckMatchingAcceptance(opts.dir)
+	// --fix=false and --no-fix are read-only. --fix and --no-fix=false
+	// are an explicit request to repair source.
+	explicitReadOnly := (fixChanged && !opts.fix) || (noFixChanged && opts.noFix)
+	explicitFix := (fixChanged && opts.fix) || (noFixChanged && !opts.noFix)
+
+	switch {
+	case explicitReadOnly:
+		opts.noFix = true
+	case explicitFix:
+		opts.noFix = false
+		if matched {
+			fmt.Fprintf(os.Stderr, "warning: passing --fix to verify invalidates the phase5 acceptance marker at %s; re-mint phase5-acceptance.json before lock promote or publish\n", match.MarkerPath)
+		}
+	case matched:
+		opts.noFix = true
+		fmt.Fprintf(os.Stderr, "shipcheck: phase5 acceptance marker matches this tree; verify will run without --fix\n")
+	}
+	return nil
+}
+
+// shipcheckMatchingAcceptance reports a phase5 acceptance marker the gate
+// accepts for this tree, including a source fingerprint that matches dir.
+// Skip markers are not acceptance. Lookup failures return false.
+func shipcheckMatchingAcceptance(dir string) (pipeline.Phase5GateValidation, bool) {
+	manifest, err := pipeline.ReadCLIManifest(dir)
+	if err != nil {
+		return pipeline.Phase5GateValidation{}, false
+	}
+	var runstateProofs string
+	if state, err := pipeline.FindStateByWorkingDir(dir); err == nil && state != nil && strings.TrimSpace(state.RunID) != "" {
+		runstateProofs = state.ProofsDir()
+	}
+	for _, proofsDir := range pipeline.Phase5ProofsDirCandidates(dir, manifest, runstateProofs) {
+		info, statErr := os.Stat(proofsDir)
+		if statErr != nil || !info.IsDir() {
+			continue
+		}
+		result := pipeline.ValidatePhase5Gate(proofsDir, manifest, dir)
+		if !result.Passed || filepath.Base(result.MarkerPath) != pipeline.Phase5AcceptanceFilename {
+			continue
+		}
+		return result, true
+	}
+	return pipeline.Phase5GateValidation{}, false
+}
+
 func newShipcheckCmd() *cobra.Command {
 	opts := &shipcheckOpts{}
 
 	cmd := &cobra.Command{
 		Use:   "shipcheck",
-		Short: "Run all six verification legs (dogfood, verify, workflow-verify, verify-skill, validate-narrative, scorecard) as one canonical Phase 4 sweep",
+		Short: "Run all verification legs as one canonical Phase 4 sweep",
 		Long: `shipcheck runs every Phase 4 verification leg in sequence and aggregates their
 exit codes into a single verdict. It is the canonical local invocation that
 matches what the public-library CI runs.
 
 Legs (in canonical order):
-  dogfood          — structural validation against the source spec
-  verify           — runtime command testing (with --fix to auto-repair common breakage)
-  workflow-verify  — primary workflow end-to-end against the verification manifest
-  verify-skill     — SKILL.md flag/positional/command consistency with the shipped CLI
+  verify           — runtime command testing (--fix auto-repair; omitted when a valid phase5 acceptance marker matches this tree)
   validate-narrative — README/SKILL narrative commands against the built CLI
+  dogfood          — structural validation against the source spec
+  workflow-verify  — primary workflow end-to-end against the verification manifest
+  apify-audit      — Apify actor reachability checks for actor-backed CLIs
+  verify-skill     — SKILL.md flag/positional/command consistency with the shipped CLI
   scorecard        — Steinberger quality bar (with --live-check sampled output probes)
 
 In default mode, every leg streams its full output to the terminal as it runs
@@ -390,17 +625,26 @@ most serious leg failure.
 
 Each leg remains callable standalone — this command is additive orchestration.`,
 		Example: `  # Canonical Phase 4 invocation
-  printing-press shipcheck \
+  cli-printing-press shipcheck \
     --dir ~/printing-press/library/notion \
     --spec ./openapi.yaml \
     --research-dir ~/printing-press/.runstate/scope/runs/RUN_ID
 
   # Without a research dir (skips the dogfood/scorecard novel-feature checks)
-  printing-press shipcheck --dir ~/printing-press/library/notion --spec ./openapi.yaml`,
+  cli-printing-press shipcheck --dir ~/printing-press/library/notion --spec ./openapi.yaml`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := validateShipcheckDir(opts.dir); err != nil {
+				return &ExitError{Code: ExitInputError, Err: err}
+			}
+			absDir, err := filepath.Abs(opts.dir)
+			if err != nil {
+				return &ExitError{Code: ExitInputError, Err: fmt.Errorf("resolving --dir: %w", err)}
+			}
+			opts.dir = absDir
+			opts.verifyNoSpec = shipcheckShouldVerifyNoSpec(opts.dir)
+			if err := applyShipcheckVerifyFixPolicy(cmd, opts); err != nil {
 				return &ExitError{Code: ExitInputError, Err: err}
 			}
 
@@ -431,6 +675,7 @@ Each leg remains callable standalone — this command is additive orchestration.
 				}
 				results = append(results, res)
 			}
+			applyShipcheckScorecardHold(results, opts.dir)
 			runElapsed := time.Since(runStart)
 
 			if opts.asJSON {
@@ -443,10 +688,12 @@ Each leg remains callable standalone — this command is additive orchestration.
 
 			code := shipcheckUmbrellaCode(results)
 			if code != 0 {
-				failing := 0
-				for _, r := range results {
-					if !r.Passed() {
-						failing++
+				failing := shipcheckFailureCount(results)
+				if failing == 0 {
+					return &ExitError{
+						Code:   code,
+						Err:    fmt.Errorf("shipcheck held: unverified"),
+						Silent: true,
 					}
 				}
 				return &ExitError{
@@ -463,11 +710,13 @@ Each leg remains callable standalone — this command is additive orchestration.
 	cmd.Flags().StringVar(&opts.spec, "spec", "", "Path to the OpenAPI spec file (passed to dogfood, verify, scorecard)")
 	cmd.Flags().StringVar(&opts.researchDir, "research-dir", "", "Pipeline directory containing research.json (passed to dogfood and scorecard)")
 	cmd.Flags().BoolVar(&opts.asJSON, "json", false, "Emit a structured JSON envelope at end-of-run (suppresses per-leg stdout for clean piping; run legs standalone with --json for per-leg detail)")
+	cmd.Flags().BoolVar(&opts.fix, "fix", false, "Pass --fix to verify even when a valid phase5 acceptance marker matches this tree (source edits invalidate that marker)")
 	cmd.Flags().BoolVar(&opts.noFix, "no-fix", false, "Disable verify's --fix auto-repair loop (read-only verify)")
 	cmd.Flags().BoolVar(&opts.noLiveCheck, "no-live-check", false, "Disable scorecard's --live-check sampled output probe")
 	cmd.Flags().StringVar(&opts.apiKey, "api-key", "", "API key for verify's live testing (read-only GETs only)")
 	cmd.Flags().StringVar(&opts.envVar, "env-var", "", "Environment variable name verify should read for the API key (e.g., GITHUB_TOKEN)")
 	cmd.Flags().BoolVar(&opts.strict, "strict", false, "Pass --strict to verify-skill (treat likely-false-positive findings as failures)")
+	cmd.Flags().BoolVar(&opts.allowDestructive, "allow-destructive", false, "Allow verify and scorecard live-check to execute mutating endpoint and research-authored examples")
 
 	return cmd
 }

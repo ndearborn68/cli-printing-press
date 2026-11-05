@@ -161,7 +161,7 @@ func TestRunCrowdSniff_NonHTTPSBaseURL(t *testing.T) {
 
 	opts := crowdSniffOptions{
 		sources: []crowdSniffSource{
-			&mockSource{result: endpointsResult("http://api.example.com",
+			&mockSource{result: endpointsResult("https://api.example.com",
 				crowdsniff.DiscoveredEndpoint{Method: "GET", Path: "/users", SourceTier: crowdsniff.TierCodeSearch, SourceName: "gh"},
 			)},
 		},
@@ -169,9 +169,29 @@ func TestRunCrowdSniff_NonHTTPSBaseURL(t *testing.T) {
 		stderr: &bytes.Buffer{},
 	}
 
-	err := runCrowdSniff(context.Background(), "test", "", "", false, opts)
+	err := runCrowdSniff(context.Background(), "test", "http://api.example.com", "", false, opts)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "base URL must use HTTPS")
+}
+
+func TestRunCrowdSniff_SkipsLoopbackCandidate(t *testing.T) {
+	t.Parallel()
+
+	outputPath := filepath.Join(t.TempDir(), "test-spec.yaml")
+	opts := crowdSniffOptions{
+		sources: []crowdSniffSource{
+			&mockSource{result: crowdsniff.SourceResult{
+				Endpoints: []crowdsniff.DiscoveredEndpoint{
+					{Method: "GET", Path: "/users", SourceTier: crowdsniff.TierCodeSearch, SourceName: "gh"},
+				},
+				BaseURLCandidates: []string{"http://127.0.0.1:${port}", "https://api.example.com"},
+			}},
+		},
+		stdout: &bytes.Buffer{},
+		stderr: &bytes.Buffer{},
+	}
+
+	require.NoError(t, runCrowdSniff(context.Background(), "test", "", outputPath, false, opts))
 }
 
 func TestRunCrowdSniff_BaseURLFlagOverridesCandidate(t *testing.T) {
@@ -231,6 +251,45 @@ func TestRunCrowdSniff_SourceErrorGracefulDegradation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "/users")
 	assert.Contains(t, string(data), "https://api.example.com")
+}
+
+func TestRunCrowdSniff_HostFilterDropSummary(t *testing.T) {
+	t.Parallel()
+
+	outputDir := t.TempDir()
+	outputPath := filepath.Join(outputDir, "test-spec.yaml")
+	var stderr bytes.Buffer
+
+	opts := crowdSniffOptions{
+		sources: []crowdSniffSource{
+			&mockSource{result: endpointsResult("https://api.example.com",
+				crowdsniff.DiscoveredEndpoint{
+					Method:        "GET",
+					Path:          "/users",
+					SourceTier:    crowdsniff.TierOfficialSDK,
+					SourceName:    "sdk",
+					OriginBaseURL: "https://api.example.com",
+				},
+				crowdsniff.DiscoveredEndpoint{
+					Method:        "POST",
+					Path:          "/uploads",
+					SourceTier:    crowdsniff.TierOfficialSDK,
+					SourceName:    "sdk",
+					OriginBaseURL: "https://uploads.example.com",
+				},
+			)},
+		},
+		stdout: &bytes.Buffer{},
+		stderr: &stderr,
+	}
+
+	err := runCrowdSniff(context.Background(), "test", "https://api.example.com", outputPath, false, opts)
+	require.NoError(t, err)
+
+	errOut := stderr.String()
+	assert.Contains(t, errOut, "filtered 1 endpoint(s) from other origins (target host: api.example.com)")
+	assert.Contains(t, errOut, "  dropped: POST /uploads (origin(s): https://uploads.example.com)")
+	assert.Contains(t, errOut, "WARNING: dropped 1 endpoint(s); generated spec covers only target host api.example.com; review the drops above.")
 }
 
 func TestRunCrowdSniff_AllSourcesFail(t *testing.T) {

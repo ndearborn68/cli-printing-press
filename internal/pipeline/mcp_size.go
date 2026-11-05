@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -122,38 +123,22 @@ func estimateMCPTokens(dir string) MCPTokenEstimate {
 	}
 
 	// The agent-facing weight of an MCP tool is the name plus description
-	// plus every parameter name and description. Rather than parsing
-	// mcp-go's builder API perfectly, we approximate by extracting all
-	// string literals in the file — the vast majority of bytes an agent
-	// sees come from those literals.
+	// plus every parameter name and description. Count string literals
+	// inside each NewTool(...) registration only — handler implementations
+	// after RegisterTools are not in the catalog.
 	literalRe := regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
 	toolRe := regexp.MustCompile(`mcplib\.NewTool\(\s*"([^"]+)"`)
 
-	literals := literalRe.FindAllString(src, -1)
-	totalChars := 0
-	for _, lit := range literals {
-		totalChars += len(lit) - 2 // strip surrounding quotes
-	}
-
-	// Per-tool sizes: slice the source between consecutive NewTool() calls
-	// and count literal chars within each slice.
 	toolStarts := toolRe.FindAllStringSubmatchIndex(src, -1)
 	toolNames := toolRe.FindAllStringSubmatch(src, -1)
 	perTool := make([]MCPToolSize, 0, len(toolNames))
+	totalChars := 0
 	for i, match := range toolNames {
 		name := match[1]
 		start := toolStarts[i][0]
-		var end int
-		if i+1 < len(toolStarts) {
-			end = toolStarts[i+1][0]
-		} else {
-			end = len(src)
-		}
-		chunk := src[start:end]
-		chunkChars := 0
-		for _, lit := range literalRe.FindAllString(chunk, -1) {
-			chunkChars += len(lit) - 2
-		}
+		end := mcpNewToolCallEnd(src, start)
+		chunkChars := countStringLiteralChars(src[start:end], literalRe)
+		totalChars += chunkChars
 		perTool = append(perTool, MCPToolSize{
 			Name:   name,
 			Chars:  chunkChars,
@@ -188,6 +173,54 @@ func estimateMCPTokens(dir string) MCPTokenEstimate {
 	}
 
 	return est
+}
+
+func countStringLiteralChars(src string, literalRe *regexp.Regexp) int {
+	total := 0
+	for _, lit := range literalRe.FindAllString(src, -1) {
+		total += len(lit) - 2
+	}
+	return total
+}
+
+// Handler bodies after NewTool must not inflate catalog token estimates.
+func mcpNewToolCallEnd(src string, start int) int {
+	open := strings.Index(src[start:], "(")
+	if open < 0 {
+		return len(src)
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start + open; i < len(src); i++ {
+		c := src[i]
+		if inStr {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(src)
 }
 
 // cobratreeFrameworkCommands mirrors the generated cobratree classify
@@ -229,6 +262,7 @@ type mcpCobraCommandKind int
 const (
 	mcpCobraNovel mcpCobraCommandKind = iota
 	mcpCobraEndpoint
+	mcpCobraGroup
 	mcpCobraFramework
 	mcpCobraHidden
 )
@@ -301,37 +335,52 @@ func sourceCommandRecord(commands map[string]*cobraSourceCommand, name string) *
 
 func reachableCobratreeRuntimeTools(commands map[string]*cobraSourceCommand) []MCPToolSize {
 	var tools []MCPToolSize
-	visited := map[string]bool{}
-	var walk func(string)
-	walk = func(fnName string) {
+	visitedPaths := map[string]bool{}
+	var walk func(string, []string, map[string]bool)
+	walk = func(fnName string, path []string, ancestors map[string]bool) {
 		rec := commands[fnName]
 		if rec == nil {
 			return
 		}
 		for _, childName := range rec.children {
-			if visited[childName] {
+			if ancestors[childName] {
 				continue
 			}
-			visited[childName] = true
 			child := commands[childName]
 			if child == nil || !child.hasLiteral {
 				continue
 			}
-			kind := cobratreeCommandKind(child.literal)
+			name := mcpCobraUseName(child.literal.use)
+			depth := len(path) + 1
+			kind := cobratreeCommandKind(child.literal, depth)
 			if kind == mcpCobraHidden || kind == mcpCobraFramework {
 				continue
 			}
+			childPath := append(append([]string{}, path...), name)
+			visitKey := strings.Join(childPath, "\x00")
+			if visitedPaths[visitKey] {
+				continue
+			}
+			visitedPaths[visitKey] = true
 			if kind == mcpCobraNovel && child.literal.runnable {
-				if tool, ok := estimateCobratreeCommandTool(child.literal); ok {
+				if tool, ok := estimateCobratreeCommandTool(child.literal, childPath); ok {
 					tools = append(tools, tool)
 				}
 			}
-			walk(childName)
+			childAncestors := cloneStringBoolMap(ancestors)
+			childAncestors[childName] = true
+			walk(childName, childPath, childAncestors)
 		}
 	}
-	walk("RootCmd")
-	walk("newRootCmd")
+	walk("RootCmd", nil, map[string]bool{"RootCmd": true})
+	walk("newRootCmd", nil, map[string]bool{"newRootCmd": true})
 	return tools
+}
+
+func cloneStringBoolMap(in map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(in))
+	maps.Copy(out, in)
+	return out
 }
 
 func isAddCommandCall(call *ast.CallExpr) bool {
@@ -380,25 +429,22 @@ func parseCobraCommandLiteral(lit *ast.CompositeLit) cobraCommandLiteral {
 	return cmd
 }
 
-func estimateCobratreeCommandTool(cmd cobraCommandLiteral) (MCPToolSize, bool) {
+func estimateCobratreeCommandTool(cmd cobraCommandLiteral, path []string) (MCPToolSize, bool) {
 	name := mcpCobraUseName(cmd.use)
 	if name == "" || cmd.hidden || !cmd.runnable {
 		return MCPToolSize{}, false
 	}
-	if cobratreeCommandKind(cmd) != mcpCobraNovel {
+	if len(path) == 0 {
+		path = []string{name}
+	}
+	if cobratreeCommandKind(cmd, len(path)) != mcpCobraNovel {
 		return MCPToolSize{}, false
 	}
-	toolName := naming.SnakeIdentifier(name)
+	toolName := naming.SnakeIdentifier(strings.Join(path, "_"))
 	if toolName == "" {
 		return MCPToolSize{}, false
 	}
-	description := cmd.long
-	if description == "" {
-		description = cmd.short
-	}
-	if description == "" {
-		description = "Run `" + name + "` through the companion CLI binary."
-	}
+	description := cobratreeToolDescription(cmd.short, cmd.long, name)
 	chars := len(toolName) + len(description)
 	return MCPToolSize{
 		Name:   "cobratree:" + toolName,
@@ -407,16 +453,19 @@ func estimateCobratreeCommandTool(cmd cobraCommandLiteral) (MCPToolSize, bool) {
 	}, true
 }
 
-func cobratreeCommandKind(cmd cobraCommandLiteral) mcpCobraCommandKind {
+func cobratreeCommandKind(cmd cobraCommandLiteral, depth int) mcpCobraCommandKind {
 	name := mcpCobraUseName(cmd.use)
-	if name == "" || cmd.hidden || annotationIsTrueValue(cmd.annotations["mcp:hidden"]) {
+	if name == "" || annotationIsTrueValue(cmd.annotations["mcp:hidden"]) {
 		return mcpCobraHidden
 	}
 	if strings.TrimSpace(cmd.annotations["pp:endpoint"]) != "" {
 		return mcpCobraEndpoint
 	}
-	if cobratreeFrameworkCommands[name] {
+	if depth == 1 && cobratreeFrameworkCommands[name] {
 		return mcpCobraFramework
+	}
+	if annotationIsTrueValue(cmd.annotations["pp:api-resource"]) || annotationIsTrueValue(cmd.annotations["pp:parent-group"]) {
+		return mcpCobraGroup
 	}
 	return mcpCobraNovel
 }
@@ -424,6 +473,28 @@ func cobratreeCommandKind(cmd cobraCommandLiteral) mcpCobraCommandKind {
 func annotationIsTrueValue(v string) bool {
 	v = strings.ToLower(strings.TrimSpace(v))
 	return v == "true" || v == "1" || v == "yes"
+}
+
+// Operator Long/--help manuals blow the MCP per-tool budget. Stay
+// aligned with the generated cobratree helper.
+func cobratreeToolDescription(short, long, commandPath string) string {
+	if desc := strings.TrimSpace(short); desc != "" {
+		return desc
+	}
+	if desc := firstHelpParagraph(long); desc != "" {
+		return desc
+	}
+	return "Run `" + commandPath + "` through the companion CLI binary."
+}
+
+func firstHelpParagraph(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	before, _, _ := strings.Cut(s, "\n\n")
+	return strings.TrimSpace(before)
 }
 
 func mcpCobraUseName(use string) string {
@@ -462,15 +533,15 @@ func normalizedStringMapLiteral(expr ast.Expr) map[string]string {
 //   - per-tool <= 320 tokens: partial (4)
 //   - per-tool > 320 tokens: 0
 //
-// Large code-orchestrated catalogs are unscored instead. Their catalog
-// payload intentionally scales with endpoint count while the exposed tool
-// count stays fixed at search+execute, so a per-tool average is not a
-// meaningful efficiency signal.
+// Code-orchestrated catalogs are unscored instead. Their catalog payload
+// intentionally scales with endpoint count while the exposed tool count stays
+// fixed at search+execute, so a per-tool average is not a meaningful
+// efficiency signal.
 //
 // Empty or missing MCP surface returns (0, false) so the dimension is
 // added to UnscoredDimensions.
 func scoreMCPTokenEfficiency(dir string) (int, bool) {
-	if canonicalMCPSurfacePath(dir) == mcpCodeOrchPath(dir) && codeOrchEndpointCount(dir) > surfaceStrategyLargeThreshold {
+	if canonicalMCPSurfacePath(dir) == mcpCodeOrchPath(dir) {
 		return 0, false
 	}
 	est := estimateMCPTokens(dir)
@@ -488,34 +559,4 @@ func scoreMCPTokenEfficiency(dir string) (int, bool) {
 	default:
 		return 0, true
 	}
-}
-
-func codeOrchEndpointCount(dir string) int {
-	file, err := parser.ParseFile(token.NewFileSet(), mcpCodeOrchPath(dir), nil, 0)
-	if err != nil {
-		return 0
-	}
-	for _, decl := range file.Decls {
-		genDecl, ok := decl.(*ast.GenDecl)
-		if !ok || genDecl.Tok != token.VAR {
-			continue
-		}
-		for _, spec := range genDecl.Specs {
-			valueSpec, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
-			}
-			for i, name := range valueSpec.Names {
-				if name.Name != "codeOrchEndpoints" || i >= len(valueSpec.Values) {
-					continue
-				}
-				lit, ok := valueSpec.Values[i].(*ast.CompositeLit)
-				if !ok {
-					return 0
-				}
-				return len(lit.Elts)
-			}
-		}
-	}
-	return 0
 }

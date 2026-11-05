@@ -8,12 +8,21 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mvanhorn/cli-printing-press/v4/internal/artifacts"
 )
 
 // RunWorkflowVerification builds the CLI and runs all workflows from the manifest.
 func RunWorkflowVerification(dir string) (*WorkflowVerifyReport, error) {
+	releaseHome, err := scopeSubprocessHome(findCLINames(dir)...)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHome()
+
 	manifest, err := LoadWorkflowManifest(dir)
 	if err != nil {
 		return nil, fmt.Errorf("loading workflow manifest: %w", err)
@@ -130,6 +139,9 @@ func executeStep(binary string, step WorkflowStep, cmdExpanded string, dir strin
 	}
 
 	args := strings.Fields(cmdExpanded)
+	if step.ArgsStdin && !workflowArgsEnableFlag(args, "stdin") {
+		args = append(args, "--stdin")
+	}
 	args = append(args, "--json")
 
 	maxAttempts := 1
@@ -139,11 +151,29 @@ func executeStep(binary string, step WorkflowStep, cmdExpanded string, dir strin
 
 	var output string
 	var cmdErr error
+	var stdin []byte
+	if step.ArgsStdin {
+		var err error
+		stdin, err = json.Marshal(step.StdinJSON)
+		if err != nil {
+			sr.Status = StepStatusFailCLIBug
+			sr.Error = fmt.Sprintf("invalid stdin_json payload: %v", err)
+			return sr
+		}
+	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		cmd := exec.CommandContext(ctx, binary, args...)
 		cmd.Dir = dir
+		if stdin != nil {
+			cmd.Stdin = strings.NewReader(string(stdin))
+		}
+		applyDefaultSubprocessEnv(cmd)
+		// Strip verify-mode env from the subprocess so an inherited
+		// PRINTING_PRESS_VERIFY=1 cannot short-circuit the live workflow
+		// path. See internal/pipeline/verify_env_filter.go for rationale.
+		cmd.Env = filterVerifyEnv(cmd.Env)
 		out, err := cmd.CombinedOutput()
 		cancel()
 
@@ -204,6 +234,23 @@ func executeStep(binary string, step WorkflowStep, cmdExpanded string, dir strin
 
 	sr.Status = StepStatusPass
 	return sr
+}
+
+func workflowArgsEnableFlag(args []string, name string) bool {
+	prefix := "--" + name
+	for _, arg := range args {
+		if arg == prefix {
+			return true
+		}
+		value, ok := strings.CutPrefix(arg, prefix+"=")
+		if ok {
+			enabled, err := strconv.ParseBool(value)
+			if err == nil && enabled {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // classifyError determines the step status from a command failure.
@@ -392,7 +439,10 @@ func deriveOverallVerdict(manifest *WorkflowManifest, results []WorkflowResult) 
 
 // writeWorkflowVerifyReport writes the report as JSON to the given directory.
 func writeWorkflowVerifyReport(dir string, report *WorkflowVerifyReport) error {
-	data, err := json.MarshalIndent(report, "", "  ")
+	// Marshal a copy so callers keep the real path they passed in.
+	emitted := *report
+	emitted.Dir = artifacts.RedactCLIDirRoot(report.Dir)
+	data, err := json.MarshalIndent(&emitted, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshaling workflow verify report: %w", err)
 	}

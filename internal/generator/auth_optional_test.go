@@ -215,23 +215,23 @@ func TestConfigLoad_LabelsConfigFileAuthSource(t *testing.T) {
 
 	require.Contains(t, src, `cfg.AuthSource = "config"`,
 		"Load() must label config-derived credentials so doctor's auth_source surface isn't blank")
-	require.Contains(t, src, `cfg.AuthHeaderVal != "" || cfg.AccessToken != ""`,
+	require.Contains(t, src, `if cfg.AuthSource == "" && cfg.hasCredentialFields()`,
 		"the config-source label must guard on a populated credential slot — empty configs should not be labeled")
 
 	// The label must apply to env-var-derived persisted fields too, not just
 	// the bearer/access-token slots — for api_key auth the env-var field is
 	// the *only* slot that matters.
-	require.Contains(t, src, `cfg.ConfigSourceLabelApiKey != ""`,
+	require.Contains(t, src, `c.ConfigSourceLabelApiKey != ""`,
 		"the env-var-derived field must also trigger the config-source label")
 
-	// The new logic must run after the env-var overrides — otherwise the env
-	// override would set AuthSource = "env:..." which we'd then stomp.
+	// The config fallback must run before env-var overrides so the later env
+	// override can still win over disk.
 	envOverrideIdx := strings.Index(src, `cfg.AuthSource = "env:CONFIG_SOURCE_LABEL_API_KEY"`)
 	configLabelIdx := strings.Index(src, `cfg.AuthSource = "config"`)
 	require.NotEqual(t, -1, envOverrideIdx, "env-var override block must be present")
 	require.NotEqual(t, -1, configLabelIdx, "config-source label must be present")
-	require.Less(t, envOverrideIdx, configLabelIdx,
-		"env-var overrides must run before the config-source fallback so env wins over disk")
+	require.Less(t, configLabelIdx, envOverrideIdx,
+		"config-source fallback must run before env-var overrides so env wins over disk")
 
 	// The label must not include cfg.Path — embedding the path leaks the
 	// user's home directory through doctor's JSON envelope. config_path is
@@ -268,6 +268,11 @@ func TestSetToken_BearerTokenUsesSaveTokens(t *testing.T) {
 		"bearer_token auth must use SaveTokens, not SaveCredential")
 	require.NotContains(t, src, "cfg.SaveCredential(",
 		"SaveCredential is api_key-only; bearer_token must not emit it")
+	require.NotContains(t, src, "ClearShadowingRequestCredentials")
+	configSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "config", "config.go"))
+	require.NoError(t, err)
+	require.NotContains(t, string(configSrc), "ClearShadowingRequestCredentials")
+	requireGeneratedCompiles(t, outputDir)
 }
 
 // TestConfigLoad_LabelsConfigFileAuthSource_EnvVarSpecsBranch covers the
@@ -299,6 +304,6 @@ func TestConfigLoad_LabelsConfigFileAuthSource_EnvVarSpecsBranch(t *testing.T) {
 
 	require.Contains(t, src, `cfg.AuthSource = "config"`,
 		"EnvVarSpecs branch must emit the config-source label")
-	require.Contains(t, src, `cfg.EnvvarSpecsSourceLabelApiKey != ""`,
+	require.Contains(t, src, `c.EnvvarSpecsSourceLabelApiKey != ""`,
 		"EnvVarSpecs branch must guard on the rich-model env-var-derived field")
 }

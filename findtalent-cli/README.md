@@ -1,0 +1,367 @@
+# Findtalent CLI
+
+FindTalent is a candidate-sourcing platform that helps recruiters find qualified candidates.
+This API provides access to candidate search, profile retrieval, and export functionality.
+
+Authentication is handled via a session cookie or bearer token obtained from the FindTalent web application.
+
+Learn more at [Findtalent](https://www.findtalent.today/).
+
+## Install
+
+The recommended path installs both the `findtalent-pp-cli` binary and the `pp-findtalent` agent skill (Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot, and other agents supported by the upstream [`skills`](https://github.com/vercel-labs/skills) CLI) in one shot:
+
+```bash
+npx -y @mvanhorn/printing-press-library install findtalent
+```
+
+For CLI only (no skill):
+
+```bash
+npx -y @mvanhorn/printing-press-library install findtalent --cli-only
+```
+
+For skill only — installs the skill into the same agents as the default command above, but skips the CLI binary (use this to update or reinstall just the skill):
+
+```bash
+npx -y @mvanhorn/printing-press-library install findtalent --skill-only
+```
+
+To constrain the skill install to one or more specific agents (repeatable — agent names match the [`skills`](https://github.com/vercel-labs/skills) CLI):
+
+```bash
+npx -y @mvanhorn/printing-press-library install findtalent --agent claude-code
+npx -y @mvanhorn/printing-press-library install findtalent --agent claude-code --agent codex
+```
+
+### Without Node
+
+The generated install path is category-agnostic until this CLI is published. If `npx` is not available before publish, install Node or use the category-specific Go fallback from the public-library entry after publish.
+
+### Pre-built binary
+
+Download a pre-built binary for your platform from the [latest release](https://github.com/mvanhorn/printing-press-library/releases/tag/findtalent-current). On macOS, clear the Gatekeeper quarantine: `xattr -d com.apple.quarantine <binary>`. On Unix, mark it executable: `chmod +x <binary>`.
+
+<!-- pp-hermes-install-anchor -->
+## Install for Hermes
+
+Install the CLI binary first. The installer writes binaries to a per-user managed bin directory by default: `$HOME/.local/bin` on macOS/Linux and `%LOCALAPPDATA%\Programs\PrintingPress\bin` on Windows.
+
+```bash
+npx -y @mvanhorn/printing-press-library install findtalent --cli-only
+```
+
+Then install the focused Hermes skill.
+
+From the Hermes CLI:
+
+```bash
+hermes skills install mvanhorn/printing-press-library/cli-skills/pp-findtalent --force
+```
+
+Inside a Hermes chat session:
+
+```bash
+/skills install mvanhorn/printing-press-library/cli-skills/pp-findtalent --force
+```
+
+Restart the Hermes session or gateway if the newly installed skill is not visible immediately.
+
+## Install for OpenClaw
+Install both the CLI binary and the focused OpenClaw skill. The installer defaults binaries to a per-user bin directory (`$HOME/.local/bin` on macOS/Linux, `%LOCALAPPDATA%\Programs\PrintingPress\bin` on Windows):
+
+```bash
+npx -y @mvanhorn/printing-press-library install findtalent --agent openclaw
+```
+
+Restart the OpenClaw session or gateway if the newly installed skill is not visible immediately.
+
+## Use with Claude Desktop
+
+This CLI ships an [MCPB](https://github.com/modelcontextprotocol/mcpb) bundle — Claude Desktop's standard format for one-click MCP extension installs (no JSON config required).
+
+To install:
+
+1. Download the `.mcpb` for your platform from the [latest release](https://github.com/mvanhorn/printing-press-library/releases/tag/findtalent-current).
+2. Double-click the `.mcpb` file. Claude Desktop opens and walks you through the install.
+3. Fill in `FINDTALENT_BEARER_AUTH` when Claude Desktop prompts you.
+
+Requires Claude Desktop 1.0.0 or later. Pre-built bundles ship for macOS Apple Silicon (`darwin-arm64`) and Windows (`amd64`, `arm64`); for other platforms, use the manual config below.
+
+<details>
+<summary>Manual JSON config (advanced)</summary>
+
+If you can't use the MCPB bundle (older Claude Desktop, unsupported platform), install the MCP binary and configure it manually.
+
+
+Install the MCP binary from this CLI's published public-library entry or pre-built release.
+
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```json
+{
+  "mcpServers": {
+    "findtalent": {
+      "command": "findtalent-pp-mcp",
+      "env": {
+        "FINDTALENT_BEARER_AUTH": "<your-key>"
+      }
+    }
+  }
+}
+```
+
+</details>
+
+### Remote MCP over HTTP
+
+`findtalent-pp-mcp --transport http` (or `PP_MCP_TRANSPORT=http`) serves streamable HTTP at `http://127.0.0.1:7777/mcp`. It refuses to start until `FINDTALENT_MCP_HTTP_TOKEN` is set to at least 32 characters, and every request must send `Authorization: Bearer <token>`. The command below prints 64 hex characters and meets that minimum. Plain HTTP is allowed only on a loopback `--addr`; any other bind, including `:7777` (every interface), also needs `--tls-cert` and `--tls-key`. Requests with no `Origin` header are accepted, as are loopback origins (`localhost`, `127.0.0.1`, or `[::1]`, any port). Any other `Origin` is refused unless it is listed in `FINDTALENT_MCP_HTTP_ALLOWED_ORIGINS`, a comma-separated list of `scheme://host[:port]` values with no path. That list is not a CORS policy; the server does not emit CORS headers.
+
+```bash
+export FINDTALENT_MCP_HTTP_TOKEN="$(openssl rand -hex 32)"
+findtalent-pp-mcp --transport http
+```
+
+Set `FINDTALENT_MCP_READ_ONLY=1` (exactly `1`) to drop mirrored commands that are not marked read-only and make the raw execute tool refuse state-changing calls. Commands marked local-write, which write only this CLI's own learn store, stay available.
+
+## Quick Start
+
+### 1. Install
+
+See [Install](#install) above.
+
+### 2. Set Up Credentials
+
+FindTalent uses session-based authentication. You need to obtain a session token from the FindTalent web application.
+
+#### Option 1: Extract Session Cookie (Recommended)
+
+1. Sign in to [FindTalent](https://www.findtalent.today/sign-in)
+2. Open your browser's Developer Tools (F12 or Right Click → Inspect)
+3. Go to the "Application" or "Storage" tab
+4. Under "Cookies", find `https://www.findtalent.today`
+5. Copy the value of the `findtalent_session` cookie
+
+Then store it:
+
+```bash
+echo "YOUR_SESSION_COOKIE_VALUE" | findtalent-pp-cli auth set-token
+```
+
+Or set it via environment variable:
+
+```bash
+export FINDTALENT_BEARER_AUTH="YOUR_SESSION_COOKIE_VALUE"
+```
+
+#### Option 2: Use API Token (if available)
+
+If FindTalent provides API tokens in your account settings:
+
+1. Sign in to [FindTalent](https://www.findtalent.today/sign-in)
+2. Navigate to your account settings or API section
+3. Generate or copy your API token
+
+Then store it:
+
+```bash
+export FINDTALENT_BEARER_AUTH="your-api-token-here"
+```
+
+**Note:** Session cookies are temporary and will expire after your session ends. For long-term automation, prefer API tokens if available from your FindTalent account.
+
+### 3. Verify Setup
+
+```bash
+findtalent-pp-cli doctor
+```
+
+This checks your configuration and credentials.
+
+### 4. Try Your First Command
+
+```bash
+findtalent-pp-cli candidates get --candidate-id cand_abc123xyz
+```
+
+## Usage
+
+Run `findtalent-pp-cli --help` for the full command reference and flag list.
+
+## Paths & environment variables
+
+This CLI separates local files into four path kinds:
+
+| Kind | Contents |
+|------|----------|
+| `config` | User-editable settings such as `config.toml` and saved profiles |
+| `data` | Durable local data: `credentials.toml`, `data.db`, cookies, browser-session proof files, and other auth sidecars |
+| `state` | Runtime state such as persisted queries, jobs, and `teach.log` |
+| `cache` | Regenerable HTTP/cache files |
+
+Each kind resolves independently. The ladder is:
+
+1. Per-kind env var: `FINDTALENT_CONFIG_DIR`, `FINDTALENT_DATA_DIR`, `FINDTALENT_STATE_DIR`, or `FINDTALENT_CACHE_DIR`
+2. `--home <dir>` for this invocation
+3. `FINDTALENT_HOME` for a flat relocated root
+4. XDG env vars: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`
+5. Platform defaults matching existing installs
+
+For containers and agent sandboxes, prefer a single relocated root:
+
+```bash
+export FINDTALENT_HOME=/srv/findtalent
+findtalent-pp-cli doctor
+```
+
+Under `FINDTALENT_HOME=/srv/findtalent`, the four dirs resolve to `/srv/findtalent/config`, `/srv/findtalent/data`, `/srv/findtalent/state`, and `/srv/findtalent/cache`.
+
+On Windows, set the same variable in PowerShell:
+
+```powershell
+$env:FINDTALENT_HOME = "C:\srv\findtalent"
+findtalent-pp-cli doctor
+```
+
+Under `$env:FINDTALENT_HOME = "C:\srv\findtalent"`, the four dirs resolve to `C:\srv\findtalent\config`, `C:\srv\findtalent\data`, `C:\srv\findtalent\state`, and `C:\srv\findtalent\cache`.
+
+MCP servers do not receive CLI flags from the host. Put relocation in the host `env` block:
+
+```json
+{
+  "mcpServers": {
+    "findtalent": {
+      "command": "findtalent-pp-mcp",
+      "env": {
+        "FINDTALENT_HOME": "/srv/findtalent"
+      }
+    }
+  }
+}
+```
+
+Precedence matters in fleets: an ambient per-kind variable such as `FINDTALENT_DATA_DIR` overrides an explicit `--home` for that kind. Use `FINDTALENT_HOME` or the per-kind variables for durable fleet relocation; treat `--home` as the weaker per-invocation lever.
+
+Relocation is one-way. Unsetting `FINDTALENT_HOME` does not move files back to platform defaults, and `doctor` cannot find credentials left under a former root. Move the files manually before unsetting relocation variables.
+
+Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `findtalent-pp-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
+
+### Local data
+
+Reads are saved locally by default: in `--data-source auto` mode every successful read is also written to the SQLite store (`data.db`, or `data-<hash>.db` per credential) in the data directory. GET responses are cached for five minutes under `http/` in the cache directory. Credentials live in `credentials.toml` in the data directory. The learn journal lives under `learn/` in the state directory. `findtalent-pp-cli doctor` prints the resolved paths, every store file, and the response-cache size.
+
+None of it is encrypted. New files are created owner-only; beyond that the data relies on OS account permissions and full-disk encryption (FileVault, BitLocker, LUKS).
+
+- **Erase it:** `findtalent-pp-cli local-data purge` lists the store files, response cache, and learn journal it would delete; add `--yes` to delete them, or `--only store|cache|journal` to narrow it. Config and credentials are kept.
+- **Run without a local copy:** set `FINDTALENT_NO_LOCAL_DATA=1`. Reads go to the API (`--data-source live`; `--data-source local` still reads an existing store), the response cache is off (`--no-cache`), nothing new is written to the store, and `sync` and `workflow archive` refuse to run. Set it in an MCP host's `env` block and every command the server runs inherits it.
+- **Choose the read source without flags:** `FINDTALENT_DATA_SOURCE=auto|live|local` sets the `--data-source` default; an explicit flag wins.
+
+## Commands
+
+### candidates
+
+Operations for searching and retrieving candidate information
+
+- **`findtalent-pp-cli candidates export`** - Export a list of candidates to CSV or JSON format.
+The candidate IDs must be provided in the request body.
+- **`findtalent-pp-cli candidates get`** - Retrieve detailed information about a specific candidate by ID
+- **`findtalent-pp-cli candidates search`** - Search for candidates based on criteria like job title, company, location, and keywords.
+Returns a list of candidate profiles with basic information.
+
+### findtalent-search
+
+Manage findtalent search
+
+- **`findtalent-pp-cli findtalent-search`** - Retrieve the user's recent search history
+
+
+### Self-learning loop
+
+This CLI caches per-question discovery so repeat queries skip the walk and structurally similar queries get answered via entity substitution. The loop also self-captures: every invocation is journaled locally, and failed-flag corrections plus fresh teaches surface as candidates on the next `recall` for confirm/reject judgment. Agents call `recall` before discovery and fire `teach &` after answering. See the `## Automatic learning` section in `SKILL.md` for the full protocol.
+
+- **`findtalent-pp-cli recall <query>`** - Look up cached resources for a query before running discovery
+- **`findtalent-pp-cli teach`** - Record a query -> resource mapping (silent on success, safe to background with `&`)
+- **`findtalent-pp-cli learnings list`** - Inspect taught rows
+- **`findtalent-pp-cli learnings forget <query>`** - Undo a teach
+- **`findtalent-pp-cli learnings candidates`** - List auto-captured candidates awaiting confirm/reject
+- **`findtalent-pp-cli learnings stats`** - Local loop metrics: recall hit rate, teach-to-reuse, playbook resolution, candidate counts
+- **`findtalent-pp-cli teach-pattern`** - Install a query/resource template up front
+- **`findtalent-pp-cli teach-lookup`** - Add an entity mapping (e.g. country code, team alias) for pattern substitution
+
+Pass `--no-learn` or set `FINDTALENT_NO_LEARN=true` to disable the loop for deterministic flows.
+
+The local store's schema version stamp is one-way: once this version of `findtalent-pp-cli` opens the database, older binaries refuse it with a version error — upgrade the binary rather than downgrading.
+
+## Output Formats
+
+```bash
+# Human-readable table (default in terminal, JSON when piped)
+findtalent-pp-cli candidates get --candidate-id cand_abc123xyz
+
+# JSON for scripting and agents
+findtalent-pp-cli candidates get --candidate-id cand_abc123xyz --json
+# Filter to specific fields
+findtalent-pp-cli candidates get --candidate-id cand_abc123xyz --json --select bio,company,education
+
+# Dry run — show the request without sending
+findtalent-pp-cli candidates get --candidate-id cand_abc123xyz --dry-run
+
+# Agent mode — JSON + compact + no prompts in one flag
+findtalent-pp-cli candidates get --candidate-id cand_abc123xyz --agent
+```
+
+`--csv` prefixes a leading `'` on cells and header keys that start with `=`, `+`, `-`, `@`, a tab, or a line break (including fullwidth `＝＋－＠`) so a spreadsheet does not run them as formulas. Plain signed numbers such as `-5` and `+2.5e3` are left unchanged.
+
+## Agent Usage
+
+This CLI is designed for AI agent consumption:
+
+- **Non-interactive** - never prompts, every input is a flag
+- **Pipeable** - `--json` output to stdout, errors to stderr
+- **Filterable** - `--select <field>[,<field>...]` returns only fields you need
+- **Previewable** - `--dry-run` shows the request without sending
+- **Explicit retries** - add `--idempotent` to create retries when a no-op success is acceptable
+- **Explicit confirmation** - `--agent` does not imply `--yes`; pass `--yes` separately only after the target, arguments, and side effects are clear
+- **Piped input** - write commands can accept structured input when their help lists `--stdin`
+- **Offline-friendly** - sync/search commands can use the local SQLite store when available
+- **Agent-safe by default** - no colors or formatting unless `--human-friendly` is set
+
+Exit codes: `0` success, `2` usage error, `3` not found, `4` auth error, `5` API error, `6` partial failure, `7` rate limited, `10` config error.
+
+## Health Check
+
+```bash
+findtalent-pp-cli doctor
+```
+
+Verifies configuration, credentials, and connectivity to the API.
+
+## Configuration
+
+Run `findtalent-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `~/.config/findtalent-pp-cli/config.toml` on macOS/Linux and `%USERPROFILE%\.config\findtalent-pp-cli\config.toml` on Windows; `--home`, `FINDTALENT_HOME`, and per-kind env vars can relocate it.
+
+Static request headers can be configured under `headers`; per-command header overrides take precedence.
+
+`--ca-cert`, `FINDTALENT_CA_CERT`, or `ca_cert` adds a PEM CA bundle to the system trust roots. `--tls-server-name`, `FINDTALENT_TLS_SERVER_NAME`, or `tls_server_name` is the name checked against the certificate when the dialed address does not match it. Precedence is flag, then environment, then the config file. A config file other users can change does not supply these settings. Certificate verification failures are not retried.
+
+Environment variables:
+
+| Name | Kind | Required | Description |
+| --- | --- | --- | --- |
+| `FINDTALENT_BEARER_AUTH` | per_call | Yes | Set to your API credential. |
+
+### agentcookie (optional)
+
+If you use agentcookie to sync secrets across machines, this CLI auto-adopts agentcookie-managed credentials with no extra setup. When the daemon writes to this CLI's config, `findtalent-pp-cli doctor` reports `agentcookie: detected` and `auth-status` labels the source as `agentcookie`. Skip this section if you don't use agentcookie - the CLI works the same as any other.
+
+## Troubleshooting
+**Authentication errors (exit code 4)**
+- Run `findtalent-pp-cli doctor` to check credentials
+- Verify the environment variable is set: `echo $FINDTALENT_BEARER_AUTH`
+**Not found errors (exit code 3)**
+- Check the resource ID is correct
+- Run the `list` command to see available items
+
+---
+
+Generated by [CLI Printing Press](https://github.com/mvanhorn/cli-printing-press)

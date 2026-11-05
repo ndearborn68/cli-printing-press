@@ -2,10 +2,12 @@ package pipeline
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Verify the scoreLiveAPIVerification helper in isolation. It answers a
@@ -179,6 +181,87 @@ func TestRunScorecard_LiveAPIVerificationWiring(t *testing.T) {
 	})
 }
 
+func TestRunScorecardCarriesApplicableUnverifiedDimensionsIntoGrade(t *testing.T) {
+	dir := t.TempDir()
+	pipelineDir := t.TempDir()
+
+	sc, err := RunScorecard(dir, pipelineDir, "", nil)
+	require.NoError(t, err)
+
+	assert.Contains(t, sc.UnverifiedDimensions, DimPathValidity)
+	assert.Contains(t, sc.UnverifiedDimensions, DimAuthProtocol)
+	assert.NotContains(t, sc.UnverifiedDimensions, DimLiveAPIVerification)
+	assert.Contains(t, sc.OverallGrade, "unverified")
+	assert.NotContains(t, sc.OverallGrade, DimLiveAPIVerification)
+
+	data, err := json.Marshal(sc)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), `"unverified_dimensions"`)
+}
+
+func TestRunScorecardOmitsUnscoredLiveVerificationFromGradeCaveat(t *testing.T) {
+	dir := t.TempDir()
+	writeScorecardFixture(t, dir, "internal/cli/widgets.go", `
+package cli
+
+func widgetsPath() string { return "/widgets" }
+`)
+	specPath := filepath.Join(dir, "spec.yaml")
+	writeScorecardFixture(t, dir, "spec.yaml", `
+name: widgets
+version: "1.0.0"
+base_url: https://api.example.com
+resources:
+  widgets:
+    endpoints:
+      list:
+        method: GET
+        path: /widgets
+`)
+
+	sc, err := RunScorecard(dir, t.TempDir(), specPath, nil)
+	require.NoError(t, err)
+
+	assert.Contains(t, sc.UnscoredDimensions, DimLiveAPIVerification)
+	assert.Empty(t, sc.UnverifiedDimensions)
+	assert.NotContains(t, sc.OverallGrade, "unverified")
+}
+
+func TestScorecardGradeLeavesFullyVerifiedGradeUnqualified(t *testing.T) {
+	sc := &Scorecard{
+		UnscoredDimensions: []string{DimMCPDescriptionQuality},
+	}
+
+	assert.Equal(t, "A", formatScorecardGrade(sc, "A"))
+}
+
+func TestRunScorecardFullyVerifiedAPIHasNoUnverifiedGradeCaveat(t *testing.T) {
+	dir := t.TempDir()
+	writeScorecardFixture(t, dir, "internal/cli/widgets.go", `
+package cli
+
+func widgetsPath() string { return "/widgets" }
+`)
+	specPath := filepath.Join(dir, "spec.yaml")
+	writeScorecardFixture(t, dir, "spec.yaml", `
+name: widgets
+version: "1.0.0"
+base_url: https://api.example.com
+resources:
+  widgets:
+    endpoints:
+      list:
+        method: GET
+        path: /widgets
+`)
+
+	sc, err := RunScorecard(dir, t.TempDir(), specPath, &VerifyReport{Mode: "live", PassRate: 100, DataPipeline: true})
+	require.NoError(t, err)
+
+	assert.Empty(t, sc.UnverifiedDimensions)
+	assert.NotContains(t, sc.OverallGrade, "unverified")
+}
+
 // Guard R5 from the plan: landing LiveAPIVerification must not change
 // tier 2 normalization for CLIs that never ran live verify. When the
 // dimension is unscored, its 10-point slot is subtracted from tier2Max,
@@ -222,4 +305,30 @@ func TestRunScorecard_LiveVerifyLiftsTotal(t *testing.T) {
 	data, err := json.Marshal(scLive)
 	assert.NoError(t, err)
 	assert.True(t, strings.Contains(string(data), "live_api_verification"))
+}
+
+func TestSkippedSampleReviewIsNotCountedAsPass(t *testing.T) {
+	dir := t.TempDir()
+	pipelineDir := t.TempDir()
+	sc, err := RunScorecard(dir, pipelineDir, "", nil)
+	require.NoError(t, err)
+	before := sc.Steinberger
+
+	skipped := &LiveCheckResult{Skipped: 4}
+	require.Equal(t, SampleReviewSkipped, skipped.SampleReviewStatus())
+	body, err := json.Marshal(skipped)
+	require.NoError(t, err)
+	require.Contains(t, string(body), `"review_status":"skipped"`)
+	require.NotContains(t, string(body), `"review_status":"pass"`)
+	ApplyLiveCheckToScorecard(sc, skipped)
+	require.Equal(t, before, sc.Steinberger, "a skipped sample-output review must not change the score")
+
+	sc.Steinberger.Insight = 10
+	recomputeScorecardTotals(sc)
+	beforeTotal := sc.Steinberger.Total
+	broken := &LiveCheckResult{Failed: 5, PassRate: 0}
+	require.Equal(t, SampleReviewSkipped, broken.SampleReviewStatus())
+	ApplyLiveCheckToScorecard(sc, broken)
+	require.Equal(t, 4, sc.Steinberger.Insight)
+	require.Less(t, sc.Steinberger.Total, beforeTotal, "mechanical sample failures still cap Insight")
 }

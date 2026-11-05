@@ -16,25 +16,32 @@ import (
 	"strings"
 )
 
+// novelCommandIfAbsentHelper is the generator-emitted duplicate-safe
+// registration helper. Lost-registration collection treats
+// addNovelCommandIfAbsent(parent, ctor(...)) as the same identity as
+// parent.AddCommand(ctor(...)).
+const novelCommandIfAbsentHelper = "addNovelCommandIfAbsent"
+
 // extractLostRegistrations walks both trees' internal/cli/ directories,
 // collects every AddCommand call expression (against any receiver — not just
-// rootCmd), and computes the lost set per host file: calls present in
-// published but missing from fresh. Lost calls whose target constructor
-// name doesn't exist in the fresh tree's internal/cli/ are flagged as
-// `skipped_for_missing_referent` rather than included for injection.
+// rootCmd) plus addNovelCommandIfAbsent(parent, ctor(...)) helper calls, and
+// computes the lost set per host file: calls present in published but missing
+// from fresh. Lost calls whose target constructor name doesn't exist in the
+// fresh tree's internal/cli/ are flagged as `skipped_for_missing_referent`
+// rather than included for injection.
 //
 // "Host file" is any internal/cli/*.go file in published that contains at
-// least one AddCommand call (root.go, plus resource-parents like
-// category.go).
+// least one AddCommand or addNovelCommandIfAbsent call (root.go, plus
+// resource-parents like category.go).
 //
 // pubVerdicts maps relative path → Apply verdict. Hosts whose verdict means
-// the published file is preserved verbatim (TEMPLATED-BODY-DRIFT,
-// TEMPLATED-WITH-ADDITIONS, NOVEL, NOVEL-COLLISION) are skipped — re-injecting
-// AddCommand calls into a file that already has them would duplicate the
-// calls and crash the resulting CLI at startup with
-// "command is already added". Pass an empty map (or a map with all entries
-// classified as TEMPLATED-CLEAN) to opt out of the filter; callers in the
-// Classify pipeline always pass the populated map.
+// the published file is preserved verbatim (NOVEL, NOVEL-COLLISION) are
+// skipped — re-injecting AddCommand calls into a file that already has them
+// would duplicate the calls and crash the resulting CLI at startup with
+// "command is already added". Drift/additions hosts are overlaid onto fresh,
+// so lost calls still need injection. Pass an empty map (or a map with all
+// entries classified as TEMPLATED-CLEAN) to opt out of the filter; callers
+// in the Classify pipeline always pass the populated map.
 func extractLostRegistrations(publishedDir, freshDir string, pubVerdicts map[string]Verdict) ([]LostRegistration, error) {
 	pubCLIDir := filepath.Join(publishedDir, "internal", "cli")
 	freshCLIDir := filepath.Join(freshDir, "internal", "cli")
@@ -104,13 +111,21 @@ func extractLostRegistrations(publishedDir, freshDir string, pubVerdicts map[str
 		}
 		// Skip hosts whose Apply verdict preserves published verbatim — the
 		// AddCommand calls already survive the merge in-place; re-injection
-		// would duplicate them.
+		// would duplicate them. Overlay hosts take fresh shared functions, so
+		// their lost calls still need injection.
 		relPath := filepath.ToSlash(filepath.Join("internal", "cli", filepath.Base(host)))
 		switch pubVerdicts[relPath] {
-		case VerdictTemplatedBodyDrift, VerdictTemplatedWithAdditions, VerdictTemplatedValueDrift, VerdictNovel, VerdictNovelCollision:
+		case VerdictNovel, VerdictNovelCollision:
 			continue
 		}
-		var lost, skipped []string
+		// Group lost/skipped calls by the function they came from so each
+		// LostRegistration targets a single registration function. A host with
+		// one such function (the common shape) still produces exactly one
+		// registration here.
+		lostByFunc := map[string][]string{}
+		skippedByFunc := map[string][]string{}
+		var funcOrder []string
+		seenFunc := map[string]bool{}
 		for _, call := range pubCalls[host] {
 			if _, present := freshCallSet[call.normalized]; present {
 				continue
@@ -120,23 +135,31 @@ func extractLostRegistrations(publishedDir, freshDir string, pubVerdicts map[str
 					continue
 				}
 			}
+			if !seenFunc[call.enclosingFunc] {
+				seenFunc[call.enclosingFunc] = true
+				funcOrder = append(funcOrder, call.enclosingFunc)
+			}
 			// Referent check.
 			if call.constructorName != "" {
 				if _, ok := freshDeclNames[call.constructorName]; !ok {
-					skipped = append(skipped, call.source)
+					skippedByFunc[call.enclosingFunc] = append(skippedByFunc[call.enclosingFunc], call.source)
 					continue
 				}
 			}
-			lost = append(lost, call.source)
+			lostByFunc[call.enclosingFunc] = append(lostByFunc[call.enclosingFunc], call.source)
 		}
-		if len(lost) == 0 && len(skipped) == 0 {
-			continue
+		for _, fn := range funcOrder {
+			lost, skipped := lostByFunc[fn], skippedByFunc[fn]
+			if len(lost) == 0 && len(skipped) == 0 {
+				continue
+			}
+			out = append(out, LostRegistration{
+				HostFile:                  relPath,
+				EnclosingFunc:             fn,
+				Calls:                     lost,
+				SkippedForMissingReferent: skipped,
+			})
 		}
-		out = append(out, LostRegistration{
-			HostFile:                  filepath.ToSlash(filepath.Join("internal", "cli", filepath.Base(host))),
-			Calls:                     lost,
-			SkippedForMissingReferent: skipped,
-		})
 	}
 	return out, nil
 }
@@ -149,10 +172,94 @@ type addCommandCall struct {
 	normalized      string // identical-ish form for diffing across files
 	parentName      string // e.g. "rootCmd"; empty when receiver shape is unrecognized
 	constructorName string // e.g. "newCanonicalCmd"; empty when arg shape is unrecognized
+	enclosingFunc   string // name of the FuncDecl the call sits in; "" if not inside one
+}
+
+func novelOnlyRegistrationCalls(calls []string, novelDecls declSet) []string {
+	kept := make([]string, 0, len(calls))
+	for _, source := range calls {
+		constructor := constructorNameFromAddCommandSource(source)
+		if constructor == "" {
+			// Inline command literals have no declaration to classify. Keep them
+			// because the lost registration itself is the only preservation signal.
+			kept = append(kept, source)
+			continue
+		}
+		if _, ok := novelDecls[constructor]; ok {
+			kept = append(kept, source)
+		}
+	}
+	return kept
+}
+
+func constructorNameFromAddCommandSource(source string) string {
+	expr, err := parser.ParseExpr(source)
+	if err != nil {
+		return ""
+	}
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return ""
+	}
+	_, ctor := registrationParentAndCtor(call)
+	return ctor
+}
+
+func isCommandRegistrationCall(ce *ast.CallExpr) bool {
+	if ce == nil {
+		return false
+	}
+	switch fun := ce.Fun.(type) {
+	case *ast.SelectorExpr:
+		return fun.Sel != nil && fun.Sel.Name == "AddCommand"
+	case *ast.Ident:
+		return fun.Name == novelCommandIfAbsentHelper && len(ce.Args) == 2
+	default:
+		return false
+	}
+}
+
+func ctorNameFromArg(arg ast.Expr) string {
+	switch a := arg.(type) {
+	case *ast.CallExpr:
+		if id, ok := a.Fun.(*ast.Ident); ok {
+			return id.Name
+		}
+	case *ast.Ident:
+		return a.Name
+	}
+	return ""
+}
+
+func registrationParentAndCtor(ce *ast.CallExpr) (parent, ctor string) {
+	if ce == nil {
+		return "", ""
+	}
+	if ident, ok := ce.Fun.(*ast.Ident); ok && ident.Name == novelCommandIfAbsentHelper {
+		if len(ce.Args) != 2 {
+			return "", ""
+		}
+		if id, ok := ce.Args[0].(*ast.Ident); ok {
+			parent = id.Name
+		}
+		return parent, ctorNameFromArg(ce.Args[1])
+	}
+	sel, ok := ce.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != "AddCommand" {
+		return "", ""
+	}
+	if id, ok := sel.X.(*ast.Ident); ok {
+		parent = id.Name
+	}
+	if len(ce.Args) > 0 {
+		ctor = ctorNameFromArg(ce.Args[0])
+	}
+	return parent, ctor
 }
 
 // collectAddCommandCalls walks all .go files under dir and collects calls of
-// the form `<recv>.AddCommand(<arg>)`. Returns:
+// the form `<recv>.AddCommand(<arg>)` and
+// `addNovelCommandIfAbsent(<recv>, <arg>)`. Returns:
 //   - calls: map of file path → list of calls in that file
 //   - hostFiles: list of files that contain at least one such call
 func collectAddCommandCalls(dir string) (map[string][]addCommandCall, []string, error) {
@@ -185,23 +292,34 @@ func collectAddCommandCalls(dir string) (map[string][]addCommandCall, []string, 
 		}
 		var fileCalls []addCommandCall
 		var inspectErr error
-		ast.Inspect(file, func(n ast.Node) bool {
-			ce, ok := n.(*ast.CallExpr)
-			if !ok {
+		// Walk per-function so each call records its enclosing function name.
+		// Re-injection uses that name to put a lost call back into the function
+		// it came from when a host file has more than one registration
+		// function. Calls outside any FuncDecl can't be re-injected into a
+		// function anyway, so they are not collected.
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if inspectErr != nil {
+					return false
+				}
+				ce, ok := n.(*ast.CallExpr)
+				if !ok || !isCommandRegistrationCall(ce) {
+					return true
+				}
+				call, err := formatCallExpr(fset, ce)
+				if err != nil {
+					inspectErr = err
+					return false
+				}
+				call.enclosingFunc = fn.Name.Name
+				fileCalls = append(fileCalls, call)
 				return true
-			}
-			sel, ok := ce.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel == nil || sel.Sel.Name != "AddCommand" {
-				return true
-			}
-			call, err := formatCallExpr(fset, ce)
-			if err != nil {
-				inspectErr = err
-				return false
-			}
-			fileCalls = append(fileCalls, call)
-			return true
-		})
+			})
+		}
 		if inspectErr != nil {
 			return nil, nil, fmt.Errorf("formatting AddCommand calls in %s: %w", path, inspectErr)
 		}
@@ -213,46 +331,24 @@ func collectAddCommandCalls(dir string) (map[string][]addCommandCall, []string, 
 	return calls, hosts, nil
 }
 
-// formatCallExpr renders an AddCommand call expression and extracts the
-// constructor name (the function called as the AddCommand argument). Returns
-// an error if the printer fails so an empty addCommandCall can never enter
-// the call set (where it would corrupt set-comparison via a "" key).
+// formatCallExpr renders a registration call expression and extracts the
+// parent plus constructor. Helper-form calls normalize to the same
+// `<parent>.AddCommand(<ctor>)` key as the selector form. Returns an error
+// if the printer fails so an empty addCommandCall can never enter the call
+// set (where it would corrupt set-comparison via a "" key).
 func formatCallExpr(fset *token.FileSet, ce *ast.CallExpr) (addCommandCall, error) {
 	var buf bytes.Buffer
 	if err := printer.Fprint(&buf, fset, ce); err != nil {
 		return addCommandCall{}, fmt.Errorf("printing AddCommand call: %w", err)
 	}
 	src := buf.String()
-
-	// Infer the constructor name from the first argument. Two shapes:
-	//  - `newX(args...)` — extract `newX` from the *ast.CallExpr.
-	//  - `someCmd` — bare ident, treat the ident as the constructor.
-	var ctor string
-	if len(ce.Args) > 0 {
-		switch arg := ce.Args[0].(type) {
-		case *ast.CallExpr:
-			if id, ok := arg.Fun.(*ast.Ident); ok {
-				ctor = id.Name
-			}
-		case *ast.Ident:
-			ctor = arg.Name
-		}
-	}
-
-	// Extract the parent receiver: `rootCmd.AddCommand(...)` -> `rootCmd`.
-	// Only handles bare-ident receivers; chained calls fall through to the
-	// text-based fallback below.
-	var parent string
-	if sel, ok := ce.Fun.(*ast.SelectorExpr); ok {
-		if id, ok := sel.X.(*ast.Ident); ok {
-			parent = id.Name
-		}
-	}
+	parent, ctor := registrationParentAndCtor(ce)
 
 	// Semantic dedup key: <parent>.AddCommand(<ctor>). Treats
-	// `rootCmd.AddCommand(newX(flags))` and `rootCmd.AddCommand(newX(&flags))`
-	// as the same call — template generations regularly tweak the
-	// argument shape (pointer vs value, added context arg, etc.) without
+	// `rootCmd.AddCommand(newX(flags))`, `rootCmd.AddCommand(newX(&flags))`,
+	// and `addNovelCommandIfAbsent(rootCmd, newX(flags))` as the same call —
+	// template generations regularly tweak the argument shape (pointer vs
+	// value, added context arg, etc.) or the helper vs selector form without
 	// changing the registration's identity. A pure text comparison would
 	// flag the older form as "lost" and re-inject it on top of the newer
 	// form, producing duplicate cobra registrations at runtime.

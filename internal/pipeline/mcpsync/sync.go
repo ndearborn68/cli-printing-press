@@ -1,15 +1,22 @@
 package mcpsync
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/mvanhorn/cli-printing-press/v4/internal/generatedmarker"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/generator"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/graphql"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/mcpoverrides"
@@ -17,6 +24,7 @@ import (
 	"github.com/mvanhorn/cli-printing-press/v4/internal/openapi"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/pipeline"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
+	"github.com/mvanhorn/cli-printing-press/v4/internal/specmeta"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
@@ -32,7 +40,7 @@ var (
 	errAnnotationSoftFail = errors.New("endpoint annotation skipped")
 )
 
-var endpointAnnotationLine = regexp.MustCompile(`(?m)^\s*Annotations: map\[string\]string\{"pp:endpoint": "[^"]+", "pp:method": "[^"]+", "pp:path": "[^"]+"(?:, "mcp:read-only": "true")?\},\s*$`)
+var endpointAnnotationLine = regexp.MustCompile(`(?m)^\s*Annotations: map\[string\]string\{"pp:endpoint": "[^"]+", "pp:method": "[^"]+", "pp:path": "[^"]+"(?:, "[^"]+": "[^"]+")*\},\s*$`)
 var staleEndpointAnnotationLine = regexp.MustCompile(`(?m)^\s*Annotations: map\[string\]string\{"pp:endpoint": "[^"]+"(?:, "mcp:read-only": "true")?\},\s*$`)
 
 type Result struct {
@@ -50,6 +58,108 @@ type Options struct {
 	Force bool
 }
 
+type mcpClientSurfaceRequirement struct {
+	name   string
+	marker string
+}
+
+// Keep this contract in lockstep with client APIs referenced by mcp_tools.go.tmpl.
+var mcpClientSurfaceRequirements = []mcpClientSurfaceRequirement{
+	{"BinaryResponseHeader", "const BinaryResponseHeader"},
+	{"New(config, timeout, rateLimit)", "func New(cfg *config.Config, timeout time.Duration, rateLimit float64) *Client"},
+	{"Client.Config", "field:Config:*config.Config"},
+	{"Client.NoCache", "field:NoCache:bool"},
+	{"Get(context.Context, ...)", "func (c *Client) Get(ctx context.Context,"},
+	{"GetWithHeaders(context.Context, ...)", "func (c *Client) GetWithHeaders(ctx context.Context,"},
+	{"PostWithParams(context.Context, ...)", "func (c *Client) PostWithParams(ctx context.Context,"},
+	{"PostWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PostWithParamsAndHeaders(ctx context.Context,"},
+	{"PostQueryWithParams(context.Context, ...)", "func (c *Client) PostQueryWithParams(ctx context.Context,"},
+	{"PostQueryWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PostQueryWithParamsAndHeaders(ctx context.Context,"},
+	{"DeleteWithParams(context.Context, ...)", "func (c *Client) DeleteWithParams(ctx context.Context,"},
+	{"DeleteWithParamsAndHeaders(context.Context, ...)", "func (c *Client) DeleteWithParamsAndHeaders(ctx context.Context,"},
+	{"PutWithParams(context.Context, ...)", "func (c *Client) PutWithParams(ctx context.Context,"},
+	{"PutWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PutWithParamsAndHeaders(ctx context.Context,"},
+	{"PatchWithParams(context.Context, ...)", "func (c *Client) PatchWithParams(ctx context.Context,"},
+	{"PatchWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PatchWithParamsAndHeaders(ctx context.Context,"},
+}
+
+var conditionalMCPClientSurfaceRequirements = []struct {
+	featureMarker string
+	requirements  []mcpClientSurfaceRequirement
+}{
+	{
+		featureMarker: "func (c *Client) PostForm(",
+		requirements: []mcpClientSurfaceRequirement{
+			{"PostFormWithParams(context.Context, ...)", "func (c *Client) PostFormWithParams(ctx context.Context,"},
+			{"PostFormWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PostFormWithParamsAndHeaders(ctx context.Context,"},
+			{"PostQueryFormWithParams(context.Context, ...)", "func (c *Client) PostQueryFormWithParams(ctx context.Context,"},
+			{"PostQueryFormWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PostQueryFormWithParamsAndHeaders(ctx context.Context,"},
+			{"PutFormWithParams(context.Context, ...)", "func (c *Client) PutFormWithParams(ctx context.Context,"},
+			{"PutFormWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PutFormWithParamsAndHeaders(ctx context.Context,"},
+			{"PatchFormWithParams(context.Context, ...)", "func (c *Client) PatchFormWithParams(ctx context.Context,"},
+			{"PatchFormWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PatchFormWithParamsAndHeaders(ctx context.Context,"},
+		},
+	},
+	{
+		featureMarker: "func (c *Client) PostMultipart(",
+		requirements: []mcpClientSurfaceRequirement{
+			{"PostMultipartWithParams(context.Context, ...)", "func (c *Client) PostMultipartWithParams(ctx context.Context,"},
+			{"PostMultipartWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PostMultipartWithParamsAndHeaders(ctx context.Context,"},
+			{"PutMultipartWithParams(context.Context, ...)", "func (c *Client) PutMultipartWithParams(ctx context.Context,"},
+			{"PutMultipartWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PutMultipartWithParamsAndHeaders(ctx context.Context,"},
+			{"PatchMultipartWithParams(context.Context, ...)", "func (c *Client) PatchMultipartWithParams(ctx context.Context,"},
+			{"PatchMultipartWithParamsAndHeaders(context.Context, ...)", "func (c *Client) PatchMultipartWithParamsAndHeaders(ctx context.Context,"},
+		},
+	},
+	{
+		featureMarker: "requestTier string",
+		requirements: []mcpClientSurfaceRequirement{
+			{"WithTier(string)", "func (c *Client) WithTier(tier string) *Client"},
+		},
+	},
+}
+
+func ensureMCPClientSurfaceCompatible(cliDir string) error {
+	clientPath := filepath.Join(cliDir, "internal", "client", "client.go")
+	data, err := os.ReadFile(clientPath)
+	if err != nil {
+		return fmt.Errorf("mcp-sync refused: reading target CLI client API: %w; reprint required before regenerating the MCP surface", err)
+	}
+	src := string(data)
+	var missing []string
+	for _, requirement := range mcpClientSurfaceRequirements {
+		if !mcpClientSurfaceMarkerPresent(src, requirement.marker) {
+			missing = append(missing, requirement.name)
+		}
+	}
+	for _, conditional := range conditionalMCPClientSurfaceRequirements {
+		if !strings.Contains(src, conditional.featureMarker) {
+			continue
+		}
+		for _, requirement := range conditional.requirements {
+			if !mcpClientSurfaceMarkerPresent(src, requirement.marker) {
+				missing = append(missing, requirement.name)
+			}
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("mcp-sync refused: target CLI client API is incompatible with the current MCP handler (missing %s); reprint required before regenerating tools.go", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func mcpClientSurfaceMarkerPresent(src, marker string) bool {
+	if !strings.HasPrefix(marker, "field:") {
+		return strings.Contains(src, marker)
+	}
+	parts := strings.Split(marker, ":")
+	if len(parts) != 3 {
+		return false
+	}
+	pattern := `(?m)^\s*` + regexp.QuoteMeta(parts[1]) + `\s+` + regexp.QuoteMeta(parts[2]) + `\s*$`
+	return regexp.MustCompile(pattern).MatchString(src)
+}
+
 func Sync(cliDir string, opts Options) (Result, error) {
 	state, err := pipeline.InspectMCPSurface(cliDir)
 	if err != nil {
@@ -58,6 +168,17 @@ func Sync(cliDir string, opts Options) (Result, error) {
 	if state.State == pipeline.MCPSurfaceHandEdited && !opts.Force {
 		return Result{}, fmt.Errorf("%w: tools.go appears hand-edited; refusing to overwrite. Use --force to override at your own risk", ErrHandEdited)
 	}
+	preserveRecipeIntents, err := hasMCPRecipeIntentRegistration(cliDir)
+	if err != nil {
+		return Result{}, fmt.Errorf("checking MCP intent registration: %w", err)
+	}
+	if err := ensureMCPClientSurfaceCompatible(cliDir); err != nil {
+		return Result{}, err
+	}
+	patchRecords, err := pipeline.LoadPatchRecords(cliDir)
+	if err != nil {
+		return Result{}, fmt.Errorf("reading patch records: %w", err)
+	}
 	// MCPSurfaceRuntime means the MCP source is already on the new walker
 	// template and we don't need to migrate that. But we still refresh
 	// metadata files (manifest.json, tools-manifest.json) because their
@@ -65,10 +186,32 @@ func Sync(cliDir string, opts Options) (Result, error) {
 	// may have changed since the last sync. Skipping these would silently
 	// freeze stale descriptions/annotations through future regen.
 	alreadyMigrated := state.State == pipeline.MCPSurfaceRuntime
+	var runtimeSnap *mcpRuntimeSnapshot
+	if alreadyMigrated {
+		runtimeSnap, err = snapshotMCPRuntime(cliDir)
+		if err != nil {
+			return Result{}, fmt.Errorf("snapshotting hand-authored MCP behavior: %w", err)
+		}
+	}
 
-	parsed, err := loadArchivedSpec(cliDir)
+	authPreference := ""
+	if manifest, err := pipeline.ReadCLIManifest(cliDir); err == nil {
+		authPreference = strings.TrimSpace(manifest.AuthPreference)
+	}
+	parsed, err := loadArchivedSpec(cliDir, authPreference)
 	if err != nil {
 		return Result{}, err
+	}
+	// The manifest's api_name is the user's chosen identity (set by
+	// generate --name) and outranks the spec's info.title slug. Without
+	// this preempt, downstream emitters (WriteToolsManifest,
+	// populateMCPMetadata, GenerateMCPSurface) regenerate mcp_binary,
+	// api_name, manifest.json's name/entry_point, and
+	// cmd/<slug>-pp-{cli,mcp}/ directories under the title-derived slug
+	// — silently flipping a "telegram" CLI to "telegram-bot" mid-sync.
+	prior, manifestNameAuthoritative := applyManifestNameOverride(cliDir, parsed)
+	if prior != "" {
+		fmt.Fprintf(os.Stderr, "mcp-sync: using manifest api_name %q over spec-derived slug %q\n", parsed.Name, prior)
 	}
 	// Validate that spec.yaml.name matches the directory's basename.
 	// Older library CLIs sometimes have drift (weather-goat's
@@ -83,12 +226,14 @@ func Sync(cliDir string, opts Options) (Result, error) {
 	// spec with a stale top-level `name:` field) by rewriting the line in
 	// place. For OpenAPI/GraphQL specs the fix is too invasive, so it
 	// falls through to the validator's --force-required error.
-	renamedFrom, err := reconcileSpecNameWithDir(cliDir, parsed)
-	if err != nil && !opts.Force {
-		return Result{}, err
-	}
-	if renamedFrom != "" {
-		fmt.Fprintf(os.Stderr, "mcp-sync: rewrote spec.yaml name from %q to %q to match directory-derived slug\n", renamedFrom, parsed.Name)
+	if !manifestNameAuthoritative {
+		renamedFrom, err := reconcileSpecNameWithDir(cliDir, parsed)
+		if err != nil && !opts.Force {
+			return Result{}, err
+		}
+		if renamedFrom != "" {
+			fmt.Fprintf(os.Stderr, "mcp-sync: rewrote spec.yaml name from %q to %q to match directory-derived slug\n", renamedFrom, parsed.Name)
+		}
 	}
 	// Preserve the existing manifest.json's display_name onto the parsed
 	// spec when the spec itself doesn't carry one. Library CLIs printed
@@ -102,7 +247,7 @@ func Sync(cliDir string, opts Options) (Result, error) {
 	// Falls through to the public library's registry.json when
 	// manifest.json has no usable value (browser-sniffed CLIs that
 	// never had a manifest, or a manifest already corrupted to the
-	// slug form). The registry is the catalog source of truth for
+	// slug form). The public-library registry is the source of truth for
 	// brand names.
 	if parsed.DisplayName == "" {
 		if existing := readExistingManifestDisplayName(cliDir); existing != "" {
@@ -129,6 +274,7 @@ func Sync(cliDir string, opts Options) (Result, error) {
 		return Result{}, err
 	}
 	features := loadNovelFeatures(cliDir)
+	preserveExistingLearnLoop(cliDir, parsed)
 	// Migration-only steps run when the surface is on the legacy
 	// template. Already-migrated CLIs skip these.
 	if !alreadyMigrated {
@@ -165,14 +311,59 @@ func Sync(cliDir string, opts Options) (Result, error) {
 	// Surface regen runs every sync — overrides applied above must reach
 	// tools.go, and WriteToolsManifest below rewrites the manifest
 	// unconditionally, so keeping tools.go in lockstep avoids drift.
+	preserveLegacyIntentFile := false
+	if preserveRecipeIntents {
+		legacyIntentsPath := filepath.Join(cliDir, "internal", "mcp", "intents.go")
+		recipeFilePath := filepath.Join(cliDir, "internal", "mcp", "recipe_intents.go")
+		_, recipeFileErr := os.Stat(recipeFilePath)
+		legacyRecipeFile := errors.Is(recipeFileErr, os.ErrNotExist)
+		if recipeFileErr != nil && !legacyRecipeFile {
+			return Result{}, fmt.Errorf("checking %s: %w", recipeFilePath, recipeFileErr)
+		}
+		preserveLegacyFile := false
+		if legacyRecipeFile && len(parsed.MCP.Intents) == 0 {
+			data, readErr := os.ReadFile(legacyIntentsPath)
+			if readErr != nil {
+				return Result{}, fmt.Errorf("reading %s: %w", legacyIntentsPath, readErr)
+			}
+			hasExplicit, parseErr := mcpIntentFileHasExplicitRegistration(string(data))
+			if parseErr != nil {
+				return Result{}, fmt.Errorf("checking explicit intents in %s: %w", legacyIntentsPath, parseErr)
+			}
+			preserveLegacyFile = !hasExplicit
+		}
+		if !preserveLegacyFile {
+			if err := preserveMCPRecipeIntentFile(cliDir, modulePath); err != nil {
+				return Result{}, fmt.Errorf("preserving MCP recipe intents: %w", err)
+			}
+		}
+		preserveLegacyIntentFile = preserveLegacyFile
+	}
+	var patchBefore map[string][]byte
+	if len(patchRecords) > 0 {
+		patchBefore, err = snapshotRecordedFiles(cliDir, patchRecords)
+		if err != nil {
+			return Result{}, fmt.Errorf("snapshotting recorded patch files: %w", err)
+		}
+	}
 	gen := generator.New(parsed, cliDir)
 	gen.NovelFeatures = features
 	gen.ModulePath = modulePath
+	gen.PreserveMCPIntentRegistration = preserveRecipeIntents
+	gen.PreserveMCPIntentFile = preserveLegacyIntentFile
 	if err := gen.GenerateMCPSurface(); err != nil {
 		return Result{}, fmt.Errorf("rendering MCP surface: %w", err)
 	}
-	if err := pipeline.WriteToolsManifest(cliDir, parsed); err != nil {
-		return Result{}, fmt.Errorf("regenerating tools-manifest.json: %w", err)
+	if err := restoreMCPRuntime(cliDir, runtimeSnap); err != nil {
+		return Result{}, fmt.Errorf("preserving hand-authored MCP behavior: %w", err)
+	}
+	if err := preserveRecordedPatchSeams(cliDir, patchRecords, patchBefore); err != nil {
+		return Result{}, fmt.Errorf("preserving recorded patch seams: %w", err)
+	}
+	// tools.go now calls Store.SearchContext. store.go is not part of the
+	// MCP surface, so an older print still has only Store.Search.
+	if err := ensureStoreSearchContext(cliDir); err != nil {
+		return Result{}, err
 	}
 	// Refresh .printing-press.json's spec-derived fields before regenerating
 	// manifest.json. WriteMCPBManifest reads provenance from disk, so
@@ -184,6 +375,13 @@ func Sync(cliDir string, opts Options) (Result, error) {
 	if err := pipeline.RefreshCLIManifestFromSpec(cliDir, parsed); err != nil {
 		return Result{}, fmt.Errorf("refreshing CLI manifest from spec: %w", err)
 	}
+	var manifestDescription string
+	if m, err := pipeline.ReadCLIManifest(cliDir); err == nil {
+		manifestDescription = m.Description
+	}
+	if err := pipeline.WriteToolsManifestWithDescription(cliDir, parsed, manifestDescription); err != nil {
+		return Result{}, fmt.Errorf("regenerating tools-manifest.json: %w", err)
+	}
 	// Regenerate the MCPB manifest too. The schema can drift between
 	// generator releases (most recently: cli_binary was removed because
 	// Claude Desktop strict-validates v0.3 keys). mcp-sync without this
@@ -192,6 +390,9 @@ func Sync(cliDir string, opts Options) (Result, error) {
 	if err := pipeline.WriteMCPBManifest(cliDir); err != nil {
 		return Result{}, fmt.Errorf("regenerating manifest.json: %w", err)
 	}
+	if err := pipeline.ValidatePatchRecords(cliDir); err != nil {
+		return Result{}, fmt.Errorf("recorded patches no longer match after mcp-sync: %w", err)
+	}
 	detail := "migrated MCP surface to runtime Cobra-tree mirror"
 	if alreadyMigrated {
 		detail = "refreshed MCP surface, manifest.json, and tools-manifest.json from current spec / .printing-press.json / mcp-descriptions.json"
@@ -199,7 +400,267 @@ func Sync(cliDir string, opts Options) (Result, error) {
 	return Result{Changed: true, Detail: detail, UnmatchedOverrideKeys: unmatched}, nil
 }
 
-func loadArchivedSpec(cliDir string) (*spec.APISpec, error) {
+func hasMCPRecipeIntentRegistration(cliDir string) (bool, error) {
+	recipePath := filepath.Join(cliDir, "internal", "mcp", "recipe_intents.go")
+	data, err := os.ReadFile(recipePath)
+	if err == nil {
+		return strings.Contains(string(data), "func RegisterRecipeIntents(") && strings.Contains(string(data), "recipeCLIPath"), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("reading %s: %w", recipePath, err)
+	}
+
+	intentsPath := filepath.Join(cliDir, "internal", "mcp", "intents.go")
+	data, err = os.ReadFile(intentsPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading %s: %w", intentsPath, err)
+	}
+	source := string(data)
+	return strings.Contains(source, "func RegisterIntents(") && strings.Contains(source, "recipeCLIPath"), nil
+}
+
+func preserveMCPRecipeIntentFile(cliDir, modulePath string) error {
+	recipePath := filepath.Join(cliDir, "internal", "mcp", "recipe_intents.go")
+	if _, err := os.Stat(recipePath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("checking %s: %w", recipePath, err)
+	}
+
+	intentsPath := filepath.Join(cliDir, "internal", "mcp", "intents.go")
+	data, err := os.ReadFile(intentsPath)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", intentsPath, err)
+	}
+	recipeSource, err := extractMCPRecipeIntentSource(string(data), modulePath)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(recipePath, recipeSource)
+}
+
+func extractMCPRecipeIntentSource(source, modulePath string) ([]byte, error) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "intents.go", source, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing intents.go: %w", err)
+	}
+
+	recipeHandlers := make(map[string]bool)
+	var registerIntents *ast.FuncDecl
+	var recipeDecls []ast.Decl
+	for _, decl := range file.Decls {
+		switch node := decl.(type) {
+		case *ast.FuncDecl:
+			if node.Name.Name == "RegisterIntents" {
+				registerIntents = node
+			}
+			if node.Body == nil {
+				continue
+			}
+			if containsMCPIntentIdentifier(node.Body, "recipeCLIPathErr") {
+				recipeHandlers[node.Name.Name] = true
+				recipeDecls = append(recipeDecls, node)
+			}
+			if isMCPRecipeHelperFunc(node.Name.Name) {
+				recipeDecls = append(recipeDecls, node)
+			}
+		case *ast.GenDecl:
+			if node.Tok != token.VAR {
+				continue
+			}
+			if containsMCPIntentIdentifier(node, "recipeCLIPath") || containsMCPIntentIdentifier(node, "recipeCLIPathErr") || containsMCPIntentIdentifier(node, "recipeCommandRoot") {
+				recipeDecls = append(recipeDecls, node)
+			}
+		}
+	}
+	// Helpers the handlers call (dash-safety, flag insertion) are not all
+	// named appendRecipe*. Pull every same-file function they reference so
+	// the preserved recipe file still compiles after the split.
+	includeReferencedRecipeFuncs(file, &recipeDecls)
+	if registerIntents == nil || len(recipeHandlers) == 0 {
+		return nil, fmt.Errorf("intents.go contains recipe markers but no extractable recipe handlers")
+	}
+
+	var registration bytes.Buffer
+	for _, stmt := range registerIntents.Body.List {
+		handler, ok := mcpIntentRegistrationHandler(stmt)
+		if !ok || !recipeHandlers[handler] {
+			continue
+		}
+		if err := format.Node(&registration, fileSet, stmt); err != nil {
+			return nil, fmt.Errorf("formatting recipe registration: %w", err)
+		}
+		registration.WriteByte('\n')
+	}
+	if registration.Len() == 0 {
+		return nil, fmt.Errorf("intents.go contains recipe handlers but no recipe registrations")
+	}
+
+	header := generatedmarker.FilePrefix()
+	if prefix, _, ok := strings.Cut(source, "package mcp"); ok {
+		header = prefix
+	}
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "%spackage mcp\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\n\tmcplib \"github.com/mark3labs/mcp-go/mcp\"\n\t\"github.com/mark3labs/mcp-go/server\"\n", header)
+	if declsContainIdentifier(recipeDecls, "bound") {
+		fmt.Fprintf(&out, "\t%q\n", modulePath+"/internal/mcp/bound")
+	}
+	if declsContainIdentifier(recipeDecls, "cli") {
+		fmt.Fprintf(&out, "\t%q\n", modulePath+"/internal/cli")
+	}
+	if declsContainIdentifier(recipeDecls, "cliutil") {
+		fmt.Fprintf(&out, "\t%q\n", modulePath+"/internal/cliutil")
+	}
+	fmt.Fprintf(&out, "\t%q\n)\n\nfunc RegisterRecipeIntents(s *server.MCPServer) {\n", modulePath+"/internal/mcp/cobratree")
+	out.Write(registration.Bytes())
+	out.WriteString("}\n\n")
+	for _, decl := range recipeDecls {
+		if err := format.Node(&out, fileSet, decl); err != nil {
+			return nil, fmt.Errorf("formatting recipe declaration: %w", err)
+		}
+		out.WriteString("\n\n")
+	}
+	formatted, err := format.Source(out.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("formatting recipe_intents.go: %w", err)
+	}
+	return formatted, nil
+}
+
+// Recipe helpers move with the handlers. Prefixes cover the generated
+// argv builders; a new helper that does not follow them is still pulled
+// in by includeReferencedRecipeFuncs when a preserved decl calls it.
+func isMCPRecipeHelperFunc(name string) bool {
+	return name == "init" ||
+		strings.HasPrefix(name, "appendRecipe") ||
+		strings.HasPrefix(name, "insertRecipe") ||
+		strings.HasPrefix(name, "recipe")
+}
+
+func includeReferencedRecipeFuncs(file *ast.File, recipeDecls *[]ast.Decl) {
+	included := make(map[ast.Decl]bool, len(*recipeDecls))
+	for _, decl := range *recipeDecls {
+		included[decl] = true
+	}
+	for {
+		added := false
+		for _, decl := range file.Decls {
+			node, ok := decl.(*ast.FuncDecl)
+			if !ok || node.Name == nil || node.Name.Name == "RegisterIntents" || included[decl] {
+				continue
+			}
+			if !declsContainIdentifier(*recipeDecls, node.Name.Name) {
+				continue
+			}
+			*recipeDecls = append(*recipeDecls, decl)
+			included[decl] = true
+			added = true
+		}
+		if !added {
+			return
+		}
+	}
+}
+
+func declsContainIdentifier(decls []ast.Decl, name string) bool {
+	for _, decl := range decls {
+		if containsMCPIntentIdentifier(decl, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsMCPIntentIdentifier(node ast.Node, name string) bool {
+	found := false
+	ast.Inspect(node, func(node ast.Node) bool {
+		ident, ok := node.(*ast.Ident)
+		if ok && ident.Name == name {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
+func mcpIntentRegistrationHandler(stmt ast.Stmt) (string, bool) {
+	switch node := stmt.(type) {
+	case *ast.ExprStmt:
+		return addToolHandlerName(node.X)
+	case *ast.BlockStmt:
+		var handler string
+		found := false
+		for _, inner := range node.List {
+			name, ok := mcpIntentRegistrationHandler(inner)
+			if !ok {
+				continue
+			}
+			handler = name
+			found = true
+		}
+		return handler, found
+	case *ast.IfStmt:
+		if name, ok := mcpIntentRegistrationHandler(node.Body); ok {
+			return name, true
+		}
+		if node.Else != nil {
+			return mcpIntentRegistrationHandler(node.Else)
+		}
+	}
+	return "", false
+}
+
+func addToolHandlerName(expr ast.Expr) (string, bool) {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return "", false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "AddTool" {
+		return "", false
+	}
+	handler, ok := call.Args[len(call.Args)-1].(*ast.Ident)
+	return handler.Name, ok
+}
+
+func mcpIntentFileHasExplicitRegistration(source string) (bool, error) {
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, "intents.go", source, 0)
+	if err != nil {
+		return false, err
+	}
+	var registerIntents *ast.FuncDecl
+	recipeHandlers := make(map[string]bool)
+	for _, decl := range file.Decls {
+		node, ok := decl.(*ast.FuncDecl)
+		if !ok || node.Body == nil {
+			continue
+		}
+		if node.Name.Name == "RegisterIntents" {
+			registerIntents = node
+		}
+		if containsMCPIntentIdentifier(node.Body, "recipeCLIPathErr") {
+			recipeHandlers[node.Name.Name] = true
+		}
+	}
+	if registerIntents == nil {
+		return false, fmt.Errorf("missing RegisterIntents function")
+	}
+	for _, stmt := range registerIntents.Body.List {
+		handler, ok := mcpIntentRegistrationHandler(stmt)
+		if ok && !recipeHandlers[handler] {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func loadArchivedSpec(cliDir, authPreference string) (*spec.APISpec, error) {
 	for _, name := range []string{"spec.yaml", "spec.yml", "spec.json", "schema.graphql", "schema.gql"} {
 		path := filepath.Join(cliDir, name)
 		data, err := os.ReadFile(path)
@@ -210,7 +671,14 @@ func loadArchivedSpec(cliDir string) (*spec.APISpec, error) {
 			return nil, fmt.Errorf("reading %s: %w", path, err)
 		}
 		if openapi.IsOpenAPI(data) {
-			return openapi.ParseWithPathLenient(data, path)
+			return openapi.ParseWithOptions(data, openapi.ParseOptions{
+				Path:           path,
+				Lenient:        true,
+				AuthPreference: authPreference,
+			})
+		}
+		if spec.LooksLikeInternalYAML(data) {
+			return spec.ParseBytes(data)
 		}
 		if graphql.IsGraphQLSDL(data) {
 			return graphql.ParseSDLBytes(path, data)
@@ -229,15 +697,78 @@ func loadNovelFeatures(cliDir string) []generator.NovelFeature {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil
 	}
-	features := make([]generator.NovelFeature, 0, len(manifest.NovelFeatures))
-	for _, nf := range manifest.NovelFeatures {
+	recorded := manifest.NovelFeatures
+	if len(manifest.NovelFeaturesBuilt) > 0 {
+		recorded = manifest.NovelFeaturesBuilt
+	}
+	features := make([]generator.NovelFeature, 0, len(recorded))
+	for _, nf := range recorded {
 		features = append(features, generator.NovelFeature{
 			Name:        nf.Name,
 			Command:     nf.Command,
 			Description: nf.Description,
 		})
 	}
+	return mergeNovelFeatureRationalesFromTools(cliDir, features)
+}
+
+// commandMirrorCapabilityRE matches the generated command_mirror_capabilities
+// entries in tools.go. Key order is the mcp_tools.go.tmpl contract.
+var commandMirrorCapabilityRE = regexp.MustCompile(`\{"name": ("(?:\\.|[^"\\])*"), "command": ("(?:\\.|[^"\\])*")(?:, "cli_command": "(?:\\.|[^"\\])*")?, "description": ("(?:\\.|[^"\\])*"), "rationale": ("(?:\\.|[^"\\])*"), "via": "mcp-command-mirror"\}`)
+
+// mergeNovelFeatureRationalesFromTools fills empty Rationale values from the
+// existing tools.go surface. mcp-sync has no --research-dir, so the
+// previously generated MCP context is the recorded source; this does not
+// invent features that are not already in the manifest.
+func mergeNovelFeatureRationalesFromTools(cliDir string, features []generator.NovelFeature) []generator.NovelFeature {
+	if len(features) == 0 {
+		return features
+	}
+	data, err := os.ReadFile(filepath.Join(cliDir, "internal", "mcp", "tools.go"))
+	if err != nil {
+		return features
+	}
+	byCommand := map[string]string{}
+	for _, match := range commandMirrorCapabilityRE.FindAllStringSubmatch(string(data), -1) {
+		if len(match) != 5 {
+			continue
+		}
+		command, err := strconv.Unquote(match[2])
+		if err != nil || command == "" {
+			continue
+		}
+		rationale, err := strconv.Unquote(match[4])
+		if err != nil || rationale == "" {
+			continue
+		}
+		byCommand[command] = rationale
+	}
+	for i := range features {
+		if features[i].Rationale != "" {
+			continue
+		}
+		if rationale := byCommand[features[i].Command]; rationale != "" {
+			features[i].Rationale = rationale
+		}
+	}
 	return features
+}
+
+// preserveExistingLearnLoop keeps learn.enabled on when mcp-sync reloads a
+// spec that never recorded the generate-time default. GenerateMCPSurface
+// deliberately does not apply ApplyLearnLoopDefault, because published CLIs
+// may lack the learn package; flipping the default there would emit a broken
+// import. When the package is already in the tree, dropping learn_protocol
+// from tools.go is a silent surface regression.
+func preserveExistingLearnLoop(cliDir string, parsed *spec.APISpec) {
+	if parsed == nil || parsed.Learn.Disabled || parsed.Learn.Enabled || parsed.Learn.EnabledSet {
+		return
+	}
+	info, err := os.Stat(filepath.Join(cliDir, "internal", "learn"))
+	if err != nil || !info.IsDir() {
+		return
+	}
+	parsed.Learn.Enabled = true
 }
 
 func ensureEndpointAnnotations(cliDir string, parsed *spec.APISpec, features []generator.NovelFeature) error {
@@ -468,6 +999,56 @@ func newRootCmd(flags *rootFlags) *cobra.Command {
 	return writeFileAtomic(path, []byte(src))
 }
 
+// defaultConfigPathFormat is the spec-derived shape the OpenAPI/internal
+// parsers emit for Config.Path. The override only migrates paths matching
+// this shape; hand-customized paths (XDG-style overrides, per-environment
+// roots) are left alone.
+const defaultConfigPathFormat = "~/.config/%s/config.toml"
+
+// applyManifestNameOverride aligns parsed.Name with the existing CLI manifest's
+// api_name (the operator's chosen identity). It returns the prior parsed.Name
+// when an override actually happened ("" otherwise: manifest missing, api_name
+// empty, or the values already agreed) and authoritative=true when the manifest
+// api_name is the identity of record — i.e. it either overrode parsed.Name or
+// already matched it. The manifest is read exactly once, and the trimmed
+// api_name is used for both the comparison and the assignment so a hand-edited
+// manifest with stray whitespace can't leak a padded name downstream.
+func applyManifestNameOverride(cliDir string, parsed *spec.APISpec) (prior string, authoritative bool) {
+	if parsed == nil {
+		return "", false
+	}
+	m, err := pipeline.ReadCLIManifest(cliDir)
+	if err != nil {
+		// fs.ErrNotExist is the expected legacy-CLI case — fall through
+		// silently. A JSON parse failure (corrupted/partially-written
+		// manifest) is not expected: it would silently revert to the
+		// pre-fix spec-derived slug with no operator signal, so surface
+		// it on stderr.
+		if !errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "mcp-sync: could not read .printing-press.json (%v); falling back to spec-derived slug\n", err)
+		}
+		return "", false
+	}
+	apiName := strings.TrimSpace(m.APIName)
+	if apiName == "" {
+		return "", false
+	}
+	if apiName == parsed.Name {
+		return "", true
+	}
+	prior = parsed.Name
+	specmeta.RebaseAuthEnvPrefix(&parsed.Auth, prior, apiName)
+	parsed.Name = apiName
+	// Omitted-config defaults remember the path they synthesized and follow
+	// this rename. Paths the parsers wrote without that marker (OpenAPI and
+	// other canonical toml paths) still migrate by shape.
+	parsed.ApplyOmittedConfigDefaults()
+	if parsed.Config.Path == fmt.Sprintf(defaultConfigPathFormat, naming.CLI(prior)) {
+		parsed.Config.Path = fmt.Sprintf(defaultConfigPathFormat, naming.CLI(apiName))
+	}
+	return prior, true
+}
+
 // readExistingManifestDisplayName returns the display_name from an
 // existing manifest.json if it's a real brand name. The only form
 // rejected is the bare lowercase slug we'd otherwise emit as last
@@ -589,10 +1170,22 @@ var internalSpecNameLine = regexp.MustCompile(`(?m)^name:[ \t]*.*$`)
 // silently. The non-empty renamedFrom return signals the caller to
 // log the rename.
 func reconcileSpecNameWithDir(cliDir string, parsed *spec.APISpec) (renamedFrom string, err error) {
-	if parsed == nil || parsed.Name == "" {
+	if parsed == nil {
 		return "", nil
 	}
 	expected := naming.TrimCLISuffix(filepath.Base(cliDir))
+	if parsed.Name == "" {
+		specPath, data, ok := findInternalYAMLSpec(cliDir)
+		if ok && !internalSpecNameLine.Match(data) {
+			rewritten := append([]byte("name: "+expected+"\n"), data...)
+			if err := writeFileAtomic(specPath, rewritten); err != nil {
+				return "", fmt.Errorf("rewriting %s: %w", specPath, err)
+			}
+		}
+		parsed.Name = expected
+		parsed.ApplyOmittedConfigDefaults()
+		return "", nil
+	}
 	if expected == parsed.Name {
 		return "", nil
 	}
@@ -606,6 +1199,7 @@ func reconcileSpecNameWithDir(cliDir string, parsed *spec.APISpec) (renamedFrom 
 	}
 	oldName := parsed.Name
 	parsed.Name = expected
+	parsed.ApplyOmittedConfigDefaults()
 	return oldName, nil
 }
 
@@ -694,7 +1288,7 @@ const mcpGoModulePath = "github.com/mark3labs/mcp-go"
 // the cobratree-era templates compile against. Pinned to whatever the
 // generator's go.mod template currently emits — bump both together.
 // TestMinMCPGoVersionMatchesGoModTemplate keeps them in lockstep.
-const minMCPGoVersionForCobratree = "v0.47.0"
+const minMCPGoVersionForCobratree = "v0.57.0"
 
 // ensureMCPGoMinVersion bumps the mark3labs/mcp-go require directive
 // in go.mod to minMCPGoVersionForCobratree when the existing pin is

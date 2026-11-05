@@ -13,19 +13,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/semver"
 	"gopkg.in/yaml.v3"
 )
 
 func TestGoreleaserLdflagsTargetMatchesVersionVar(t *testing.T) {
-	// The goreleaser config injects the version via ldflags into
-	// internal/version.Version. If the variable is renamed or moved,
-	// goreleaser silently injects into nothing and the binary
-	// reports the hardcoded fallback. This test catches that drift.
-
-	// 1. Verify the version variable exists and is settable.
-	assert.IsType(t, "", version.Version)
-
-	// 2. Verify the goreleaser config references the correct ldflags path.
+	// Keep the release configuration pointed at the version variable used by the binary.
 	data, err := os.ReadFile("../../.goreleaser.yaml")
 	require.NoError(t, err)
 
@@ -78,36 +71,91 @@ func TestVersionConsistencyAcrossFiles(t *testing.T) {
 		"plugin.json and version.go hardcoded version must match")
 }
 
-func TestInternalSkillMinimumBinaryVersionsTrackMajor(t *testing.T) {
-	// Skill frontmatter `version` values are not release-managed. The
-	// executable compatibility contract is `min-binary-version`; keep the
-	// frontmatter and the duplicated setup-contract comment in sync.
-	want := fmt.Sprintf("%d.0.0", majorVersion(t, version.Version))
-	paths := []string{
-		"../../skills/printing-press/SKILL.md",
-		"../../skills/printing-press-catalog/SKILL.md",
-		"../../skills/printing-press-polish/SKILL.md",
-		"../../skills/printing-press-publish/SKILL.md",
-		"../../skills/printing-press-score/SKILL.md",
+func TestInternalSkillMinimumBinaryVersions(t *testing.T) {
+	// min-binary-version is the skill-requires-binary floor. Sibling skills
+	// that do not document newer binary capabilities stay on the major
+	// baseline. printing-press moves when its phase text depends on a newer
+	// release; frontmatter, the setup comment, and _min_binary_version= must
+	// match. printing-press-publish moves when its text does: Step 4.5 passes
+	// --reuse-live-happy-path. Skill frontmatter `version` is the reverse contract (see
+	// TestPrintingPressSkillVersionMatchesBinaryFloor).
+	majorFloor := fmt.Sprintf("%d.0.0", majorVersion(t, version.Version))
+	const liveHappyPathFloor = "4.33.0"
+	const dogfoodHoldReceiptFloor = "4.33.5"
+	const reuseLiveHappyPathFloor = "4.34.3"
+	const postAcceptanceShipcheckFloor = "4.35.2"
+	paths := []struct {
+		frontmatter string
+		setup       string
+	}{
+		{"../../skills/printing-press/SKILL.md", "../../skills/printing-press/phases/01-preflight.md"},
+		{"../../skills/printing-press-polish/SKILL.md", "../../skills/printing-press-polish/SKILL.md"},
+		{"../../skills/printing-press-publish/SKILL.md", "../../skills/printing-press-publish/SKILL.md"},
+		{"../../skills/printing-press-score/SKILL.md", "../../skills/printing-press-score/SKILL.md"},
 	}
 
 	frontmatterRe := regexp.MustCompile(`(?m)^min-binary-version:\s*"?([^"\n]+)"?\s*$`)
 	commentRe := regexp.MustCompile(`(?m)^# min-binary-version:\s*([^\s]+)\s*$`)
-	for _, path := range paths {
-		t.Run(path, func(t *testing.T) {
-			data, err := os.ReadFile(path)
+	assignRe := regexp.MustCompile(`(?m)^_min_binary_version=([^\s]+)\s*$`)
+	for _, paths := range paths {
+		t.Run(paths.frontmatter, func(t *testing.T) {
+			data, err := os.ReadFile(paths.frontmatter)
 			require.NoError(t, err)
 			content := string(data)
 
 			frontmatter := frontmatterRe.FindStringSubmatch(content)
 			require.Len(t, frontmatter, 2, "skill must declare min-binary-version frontmatter")
-			assert.Equal(t, want, frontmatter[1])
+			require.True(t, semver.IsValid("v"+frontmatter[1]), "min-binary-version must be major.minor.patch")
 
-			comment := commentRe.FindStringSubmatch(content)
+			setupData, err := os.ReadFile(paths.setup)
+			require.NoError(t, err)
+			comment := commentRe.FindStringSubmatch(string(setupData))
 			require.Len(t, comment, 2, "setup contract must duplicate min-binary-version")
 			assert.Equal(t, frontmatter[1], comment[1])
+
+			if paths.frontmatter == "../../skills/printing-press/SKILL.md" {
+				assert.False(t, semver.Compare("v"+frontmatter[1], "v"+liveHappyPathFloor) < 0,
+					"printing-press min-binary-version must cover pp:live-happy-path (%s)", liveHappyPathFloor)
+				assert.False(t, semver.Compare("v"+frontmatter[1], "v"+dogfoodHoldReceiptFloor) < 0,
+					"printing-press min-binary-version must cover the dogfood hold archive handoff (%s)", dogfoodHoldReceiptFloor)
+				assert.False(t, semver.Compare("v"+frontmatter[1], "v"+postAcceptanceShipcheckFloor) < 0,
+					"printing-press min-binary-version must cover read-only shipcheck verify after a valid phase5 acceptance marker (%s)", postAcceptanceShipcheckFloor)
+				assign := assignRe.FindStringSubmatch(string(setupData))
+				require.Len(t, assign, 2, "setup contract must assign _min_binary_version")
+				assert.Equal(t, frontmatter[1], assign[1])
+				return
+			}
+			if paths.frontmatter == "../../skills/printing-press-publish/SKILL.md" {
+				assert.False(t, semver.Compare("v"+frontmatter[1], "v"+reuseLiveHappyPathFloor) < 0,
+					"printing-press-publish min-binary-version must cover --reuse-live-happy-path (%s)", reuseLiveHappyPathFloor)
+				return
+			}
+			assert.Equal(t, majorFloor, frontmatter[1])
 		})
 	}
+}
+
+func TestPrintingPressSkillVersionMatchesBinaryFloor(t *testing.T) {
+	skillData, err := os.ReadFile("../../skills/printing-press/SKILL.md")
+	require.NoError(t, err)
+	setupData, err := os.ReadFile("../../skills/printing-press/phases/01-preflight.md")
+	require.NoError(t, err)
+
+	versionRe := regexp.MustCompile(`(?m)^version:\s*"?([^"\n]+)"?\s*$`)
+	commentRe := regexp.MustCompile(`(?m)^# skill-version:\s*([^\s]+)\s*$`)
+	assignRe := regexp.MustCompile(`(?m)^_this_skill_version=([^\s]+)\s*$`)
+
+	frontmatter := versionRe.FindStringSubmatch(string(skillData))
+	require.Len(t, frontmatter, 2, "printing-press skill must declare version frontmatter")
+	assert.Equal(t, MinSkillVersion, frontmatter[1])
+
+	comment := commentRe.FindStringSubmatch(string(setupData))
+	require.Len(t, comment, 2, "setup contract must duplicate skill-version")
+	assert.Equal(t, frontmatter[1], comment[1])
+
+	assign := assignRe.FindStringSubmatch(string(setupData))
+	require.Len(t, assign, 2, "setup contract must assign _this_skill_version")
+	assert.Equal(t, frontmatter[1], assign[1])
 }
 
 func TestMarketplaceJSONHasNoPluginVersion(t *testing.T) {
@@ -173,6 +221,22 @@ func majorVersion(t *testing.T, v string) int {
 	major, err := strconv.Atoi(parts[0])
 	require.NoError(t, err, "Version major %q must be an integer", parts[0])
 	return major
+}
+
+func TestPlansDirectoryGitignored(t *testing.T) {
+	// The cli-printing-press repo is public. Plans in docs/plans/ frequently
+	// describe in-progress, unreleased, or third-party-collaborator work that
+	// should not be world-readable. The /docs/plans/ gitignore line enforces
+	// this; if someone removes it in a cleanup commit, plans silently start
+	// landing on GitHub again.
+	//
+	// See AGENTS.md "Plan documents stay local" for the rule.
+	data, err := os.ReadFile("../../.gitignore")
+	require.NoError(t, err)
+
+	gitignore := string(data)
+	assert.Contains(t, gitignore, "\n/docs/plans/",
+		".gitignore must ignore /docs/plans/ — see AGENTS.md 'Plan documents stay local'")
 }
 
 func TestPRTitleWorkflowAllowsReleasePleaseScope(t *testing.T) {

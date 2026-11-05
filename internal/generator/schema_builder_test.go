@@ -1,6 +1,7 @@
 package generator
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
@@ -38,23 +39,91 @@ func TestToSnakeCase(t *testing.T) {
 	}
 }
 
-func TestSafeSQLNameQuotesUnsafeIdentifiers(t *testing.T) {
+func TestSafeSQLNameAlwaysQuotes(t *testing.T) {
 	tests := []struct {
 		name string
 		in   string
 		want string
 	}{
-		{name: "bare identifier", in: "messages", want: "messages"},
-		{name: "reserved word", in: "references", want: `"references"`},
+		{name: "plain identifier", in: "messages", want: `"messages"`},
+		{name: "non-strict reserved word", in: "references", want: `"references"`},
+		{name: "strict reserved word", in: "add", want: `"add"`},
 		{name: "starts with digit", in: "0", want: `"0"`},
 		{name: "derived starts with digit", in: "0_fts", want: `"0_fts"`},
 		{name: "contains punctuation", in: "foo/bar", want: `"foo/bar"`},
-		{name: "escapes quote", in: `foo"bar`, want: `"foo""bar"`},
+		{name: "escapes embedded quote", in: `foo"bar`, want: `"foo""bar"`},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, safeSQLName(tt.in))
+		})
+	}
+}
+
+func TestBuildSchemaRoutesReservedStoreTablesToGenericOnly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		resource  string
+		streaming bool
+		learn     bool
+	}{
+		{name: "generic resources table", resource: "resources"},
+		{name: "fts shadow table", resource: "resources_fts_data"},
+		{name: "lazy learn table", resource: "learn_recall_misses", learn: true},
+		{name: "lazy derive offset table", resource: "learn_derive_offset", learn: true},
+		{name: "disabled learn table remains reserved", resource: "search_learnings"},
+		{name: "framework index", resource: "idx_resources_type"},
+		{name: "stream frames table", resource: "collision_a_p_i_stream_frames", streaming: true},
+		{name: "disabled stream table remains reserved", resource: "collision_a_p_i_stream_frames"},
+		{name: "stream metadata table", resource: "collision_a_p_i_stream_metadata", streaming: true},
+		{name: "stream rebase table", resource: "collision_a_p_i_rebase_log", streaming: true},
+		{name: "stream metadata index", resource: "collision_a_p_i_stream_metadata_status", streaming: true},
+		{name: "stream rebase index", resource: "collision_a_p_i_rebase_log_created", streaming: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiSpec := &spec.APISpec{
+				Name: "CollisionAPI",
+				Resources: map[string]spec.Resource{
+					tt.resource: {
+						Endpoints: map[string]spec.Endpoint{
+							"list": {
+								Method:   "GET",
+								Path:     "/items",
+								Response: spec.ResponseDef{Type: "array", Item: "Resource"},
+							},
+						},
+					},
+				},
+				Types: map[string]spec.TypeDef{
+					"Resource": {
+						Fields: []spec.TypeField{
+							{Name: "id", Type: "string"},
+							{Name: "name", Type: "string"},
+							{Name: "notes", Type: "string"},
+							{Name: "created_at", Type: "string", Format: "date-time"},
+						},
+					},
+				},
+			}
+			if tt.streaming {
+				apiSpec.Streaming = spec.StreamingConfig{Transport: "websocket"}
+			}
+			apiSpec.Learn.Enabled = tt.learn
+
+			table := findTable(BuildSchema(apiSpec), tt.resource)
+			if !assert.NotNil(t, table) {
+				return
+			}
+			assert.Equal(t, baseTableColumns, table.Columns)
+			assert.Empty(t, table.Indexes)
+			assert.False(t, table.FTS5)
+			assert.Empty(t, table.FTS5Fields)
+			assert.False(t, table.FTS5Triggers)
 		})
 	}
 }
@@ -290,6 +359,44 @@ func TestBuildSchema_NoResponseTypeFallback(t *testing.T) {
 				"unresolved response type must yield only the base columns; got %v", names)
 		})
 	}
+}
+
+func TestBuildSchema_WideResponseFallsBackToJSONOnlyTable(t *testing.T) {
+	fields := []spec.TypeField{{Name: "id", Type: "string"}}
+	for i := range maxStoreDomainTableColumns {
+		fields = append(fields, spec.TypeField{Name: "setting_" + strconv.Itoa(i), Type: "string"})
+	}
+
+	s := &spec.APISpec{
+		Resources: map[string]spec.Resource{
+			"control": {
+				Endpoints: map[string]spec.Endpoint{
+					"get": {
+						Method:   "GET",
+						Path:     "/Control",
+						Response: spec.ResponseDef{Type: "object", Item: "Control"},
+					},
+				},
+			},
+		},
+		Types: map[string]spec.TypeDef{
+			"Control": {Fields: fields},
+		},
+	}
+
+	control := findTable(BuildSchema(s), "control")
+	require.NotNil(t, control, "control table should be emitted")
+
+	names := make([]string, 0, len(control.Columns))
+	for _, c := range control.Columns {
+		names = append(names, c.Name)
+	}
+	assert.ElementsMatch(t, []string{"id", "data", "synced_at"}, names,
+		"wide resources must fall back to JSON-only columns to stay under SQLite's column cap")
+	assert.True(t, control.JSONOnlyFallback, "wide fallback should still emit a per-resource JSON-only table")
+	assert.Greater(t, control.OriginalColumnCount, maxStoreDomainTableColumns)
+	assert.Empty(t, control.Indexes, "wide fallback must not retain typed-column indexes")
+	assert.False(t, control.FTS5, "wide fallback must not emit typed-table FTS triggers")
 }
 
 // TestBuildSchema_SubResourceCollisionShardsByParent pins the fix for issue
@@ -540,6 +647,140 @@ func TestBuildSchema_SubResourceUniqueKeepsBareName(t *testing.T) {
 	messages := byName["messages"]
 	require.Greater(t, len(messages.Columns), 1)
 	assert.Equal(t, "channels_id", messages.Columns[1].Name, "FK column matches sole parent")
+	assert.Equal(t, parentFKColumnName("channels"), messages.Columns[1].Name,
+		"single-word parent FK must stay the helper's unchanged form")
+}
+
+func TestParentFKColumnName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		parent string
+		want   string
+	}{
+		{parent: "chats", want: "chats_id"},
+		{parent: "chat-attendees", want: "chat_attendees_id"},
+		{parent: "groups-2", want: "groups_2_id"},
+		{parent: "routing-forms", want: "routing_forms_id"},
+		{parent: "agent-runners", want: "agent_runners_id"},
+		{parent: "chat_attendees", want: "chat_attendees_id"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.parent, func(t *testing.T) {
+			assert.Equal(t, tt.want, parentFKColumnName(tt.parent))
+		})
+	}
+}
+
+func TestBuildSchema_HyphenatedParentFKColumn(t *testing.T) {
+	t.Parallel()
+
+	s := &spec.APISpec{
+		Resources: map[string]spec.Resource{
+			"chat-attendees": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/chat-attendees"},
+				},
+				SubResources: map[string]spec.Resource{
+					"chats": {
+						Endpoints: map[string]spec.Endpoint{
+							"list": {Method: "GET", Path: "/chat-attendees/{id}/chats"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	tables := BuildSchema(s)
+	chats := findTable(tables, "chats")
+	require.NotNil(t, chats, "unique chats sub-resource should keep its bare table")
+	require.Greater(t, len(chats.Columns), 1)
+	assert.Equal(t, "chat_attendees_id", chats.Columns[1].Name)
+	assert.Equal(t, parentFKColumnName("chat-attendees"), chats.Columns[1].Name,
+		"typed-table FK column and helper must agree for hyphenated parents")
+	assert.Equal(t, parentFKColumnName(toSnakeCase("chat-attendees")), chats.Columns[1].Name,
+		"helper must be stable on already-normalized parent table names")
+}
+
+func TestBuildSchemaMarksParameterKeyedResources(t *testing.T) {
+	t.Parallel()
+
+	s := &spec.APISpec{
+		Name: "param-key",
+		Resources: map[string]spec.Resource{
+			"forecast": {
+				Endpoints: map[string]spec.Endpoint{
+					"get": {Method: "GET", Path: "/v1/forecast", Response: spec.ResponseDef{Type: "object", Item: "Forecast"}},
+				},
+			},
+			"widgets": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/widgets", Response: spec.ResponseDef{Type: "array", Item: "Widget"}},
+				},
+			},
+			"currencies": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/currencies", Response: spec.ResponseDef{Type: "array", Item: "Currency"}},
+				},
+			},
+		},
+		Types: map[string]spec.TypeDef{
+			"Forecast": {Fields: []spec.TypeField{
+				{Name: "latitude", Type: "number"},
+				{Name: "longitude", Type: "number"},
+				{Name: "timezone", Type: "string"},
+				{Name: "hourly", Type: "object"},
+			}},
+			"Widget": {Fields: []spec.TypeField{
+				{Name: "id", Type: "string"},
+				{Name: "name", Type: "string"},
+			}},
+			"Currency": {Fields: []spec.TypeField{
+				{Name: "currency_code", Type: "string"},
+				{Name: "symbol", Type: "string"},
+			}},
+		},
+	}
+
+	tables := BuildSchema(s)
+	forecast := findTable(tables, "forecast")
+	require.NotNil(t, forecast)
+	assert.True(t, forecast.ParameterKeyed, "id-less forecast must be parameter-keyed")
+
+	widgets := findTable(tables, "widgets")
+	require.NotNil(t, widgets)
+	assert.False(t, widgets.ParameterKeyed, "id-bearing widgets must stay entity-keyed")
+
+	currencies := findTable(tables, "currencies")
+	require.NotNil(t, currencies)
+	assert.False(t, currencies.ParameterKeyed, "currency_code is a store identity suffix")
+}
+
+func TestBuildSchemaResourceIDFieldIsNotParameterKeyed(t *testing.T) {
+	t.Parallel()
+
+	s := &spec.APISpec{
+		Name: "home",
+		Resources: map[string]spec.Resource{
+			"states": {
+				IDField: "entity_id",
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/states", Response: spec.ResponseDef{Type: "array", Item: "State"}},
+				},
+			},
+		},
+		Types: map[string]spec.TypeDef{
+			"State": {Fields: []spec.TypeField{
+				{Name: "entity_id", Type: "string"},
+				{Name: "state", Type: "string"},
+			}},
+		},
+	}
+
+	states := findTable(BuildSchema(s), "states")
+	require.NotNil(t, states)
+	assert.False(t, states.ParameterKeyed, "resource-level id_field is a declared entity id")
 }
 
 // findTable returns nil when no match exists so callers can render

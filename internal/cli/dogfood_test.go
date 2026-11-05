@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +12,91 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPrintDogfoodReportQualifiesPassWhenNoSpec(t *testing.T) {
+	report := &pipeline.DogfoodReport{
+		Dir:        t.TempDir(),
+		SpecSource: pipeline.DogfoodSpecSourceNone,
+		Verdict:    "PASS",
+		PathCheck: pipeline.PathCheckResult{
+			Skipped: true,
+			Detail:  "no resolvable spec; 3 command(s) unvalidated",
+		},
+		AuthCheck: pipeline.AuthCheckResult{
+			Match:   false,
+			Skipped: true,
+			Detail:  "spec not provided; auth protocol check skipped",
+		},
+	}
+
+	out := captureStdout(t, func() {
+		printDogfoodReport(report)
+	})
+
+	assert.Contains(t, out, "Path Validity:     0/0 valid (SKIP)")
+	assert.Contains(t, out, "no resolvable spec; 3 command(s) unvalidated")
+	assert.Contains(t, out, "Auth Protocol:     SKIP")
+	assert.Contains(t, out, "Verdict: PASS (path/auth checks skipped — no spec)")
+	assert.NotContains(t, out, "Verdict: PASS\n")
+}
+
+func TestPrintDogfoodReportDoesNotWarnWhenSyncCommandIsAbsent(t *testing.T) {
+	report := &pipeline.DogfoodReport{
+		Dir:     t.TempDir(),
+		Verdict: pipeline.DogfoodVerdictPass,
+		PipelineCheck: pipeline.PipelineResult{
+			SyncFileEmitted:   false,
+			SyncCallsDomain:   false,
+			SearchCallsDomain: true,
+			DomainTables:      1,
+		},
+	}
+
+	out := captureStdout(t, func() {
+		printDogfoodReport(report)
+	})
+
+	assert.Contains(t, out, "Data Pipeline:     GOOD")
+	assert.NotContains(t, out, "PARTIAL")
+	assert.Contains(t, out, "Sync: SKIP (no sync command)")
+	assert.NotContains(t, out, "Sync: uses generic Upsert only")
+}
+
+func TestPrintDogfoodReportDescribesSyncWithoutUpsertAccurately(t *testing.T) {
+	report := &pipeline.DogfoodReport{
+		Dir:     t.TempDir(),
+		Verdict: pipeline.DogfoodVerdictWarn,
+		PipelineCheck: pipeline.PipelineResult{
+			SyncFileEmitted: true,
+		},
+	}
+
+	out := captureStdout(t, func() {
+		printDogfoodReport(report)
+	})
+
+	assert.Contains(t, out, "Sync: Upsert calls not found")
+	assert.NotContains(t, out, "Sync: uses generic Upsert only")
+}
+
+func TestPrintDogfoodReportShowsUnreadableSyncFile(t *testing.T) {
+	report := &pipeline.DogfoodReport{
+		Dir:     t.TempDir(),
+		Verdict: pipeline.DogfoodVerdictWarn,
+		PipelineCheck: pipeline.PipelineResult{
+			SyncFileEmitted:   true,
+			SyncFileReadError: true,
+		},
+	}
+
+	out := captureStdout(t, func() {
+		printDogfoodReport(report)
+	})
+
+	assert.Contains(t, out, "Sync: could not read sync.go")
+	assert.NotContains(t, out, "Sync: SKIP (no sync command)")
+	assert.NotContains(t, out, "Sync: Upsert calls not found")
+}
 
 func TestPrintDogfoodReportRespectsSkippedPathCheck(t *testing.T) {
 	report := &pipeline.DogfoodReport{
@@ -31,6 +117,56 @@ func TestPrintDogfoodReportRespectsSkippedPathCheck(t *testing.T) {
 	assert.NotContains(t, out, "Path Validity:     0/0 valid (FAIL)")
 }
 
+// TestPrintDogfoodReportRendersEmptyMatrixAsNA covers the cosmetic
+// divide-by-zero in the path-validity renderer when SpecPath is present and
+// the check is not Skipped but Tested is zero (small-surface CLIs whose
+// command tree didn't produce any path-validity matrix entries). The
+// scorecard's Path Validity dim correctly reports 10/10 in the same run, so
+// rendering FAIL here is misleading to a first-time reader.
+func TestPrintDogfoodReportRendersEmptyMatrixAsNA(t *testing.T) {
+	report := &pipeline.DogfoodReport{
+		Dir:      t.TempDir(),
+		SpecPath: "petstore.yaml",
+		PathCheck: pipeline.PathCheckResult{
+			Tested:  0,
+			Valid:   0,
+			Skipped: false,
+		},
+	}
+
+	out := captureStdout(t, func() {
+		printDogfoodReport(report)
+	})
+
+	assert.Contains(t, out, "Path Validity:     0/0 valid (N/A)")
+	assert.NotContains(t, out, "Path Validity:     0/0 valid (FAIL)")
+}
+
+func TestPrintDogfoodReportDescribesOAuthScopeAlternatives(t *testing.T) {
+	report := &pipeline.DogfoodReport{
+		Dir:      t.TempDir(),
+		SpecPath: "youtube.yaml",
+		OAuthScopeCoverage: pipeline.OAuthScopeCoverageResult{
+			Checked: 1,
+			Violations: []pipeline.OAuthScopeCoverageViolation{
+				{
+					Endpoint:                  "GET /analytics",
+					OperationID:               "listAnalytics",
+					RequiredScopes:            []string{"youtube", "yt-analytics.readonly"},
+					RequiredScopeAlternatives: [][]string{{"youtube", "yt-analytics.readonly"}},
+				},
+			},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		printDogfoodReport(report)
+	})
+
+	assert.Contains(t, out, "GET /analytics (op-id listAnalytics) requires all of youtube, yt-analytics.readonly, none in auth.go")
+	assert.NotContains(t, out, "requires one of youtube, yt-analytics.readonly")
+}
+
 func TestDogfoodHelpIncludesLiveFlags(t *testing.T) {
 	cmd := newDogfoodCmd()
 	cmd.SetArgs([]string{"--help"})
@@ -40,7 +176,9 @@ func TestDogfoodHelpIncludesLiveFlags(t *testing.T) {
 
 	assert.Contains(t, output, "--live")
 	assert.Contains(t, output, "--level")
+	assert.Contains(t, output, "--auth-tier")
 	assert.Contains(t, output, "--write-acceptance")
+	assert.Contains(t, output, "--overwrite-command-mirror")
 }
 
 func TestPrintLiveDogfoodReportDistinguishesPassWithSkips(t *testing.T) {
@@ -71,6 +209,23 @@ func TestPrintLiveDogfoodReportDistinguishesPassWithSkips(t *testing.T) {
 	})
 	assert.Contains(t, withSkips, "Verdict:    PASS (with skips)")
 	assert.NotContains(t, withSkips, "PASS (all tests run)")
+}
+
+func TestPrintLiveDogfoodReportNamesHappyArgsOnHollowCoverage(t *testing.T) {
+	reason := `non-id positional "dimension" at depth 0; set pp:happy-args`
+	out := captureStdout(t, func() {
+		printLiveDogfoodReport(&pipeline.LiveDogfoodReport{
+			Dir:            t.TempDir(),
+			Level:          "full",
+			Verdict:        "PASS",
+			Passed:         1,
+			CoverageHollow: true,
+			HollowFeatures: []string{"bare", "widgets list"},
+			HollowReasons:  map[string]string{"bare": reason},
+			Commands:       []string{"bare", "widgets list"},
+		})
+	})
+	assert.Contains(t, out, "HOLLOW - 2 novel feature(s) never executed: bare ("+reason+"), widgets list")
 }
 
 func TestDogfoodLiveQuickPassWithSkipsWritesAcceptance(t *testing.T) {
@@ -134,10 +289,10 @@ if [ "${1:-}" = "agent-context" ]; then
 {
   "commands": [
     {"name":"alpha","subcommands":[
-      {"name":"list"}
+      {"name":"list","annotations":{"pp:method":"GET"}}
     ]},
     {"name":"widgets","subcommands":[
-      {"name":"list"}
+      {"name":"list","annotations":{"pp:method":"GET"}}
     ]}
   ]
 }
@@ -185,5 +340,61 @@ echo "unexpected args: $*" >&2
 exit 99
 `
 	require.NoError(t, os.WriteFile(binPath, []byte(script), 0o755))
+	return dir
+}
+
+func TestDogfoodReuseLiveHappyPathRequiresLive(t *testing.T) {
+	cmd := newDogfoodCmd()
+	cmd.SetArgs([]string{"--dir", t.TempDir(), "--reuse-live-happy-path", "marker.json"})
+	_, err := runWithCapturedStdout(t, cmd.Execute)
+	var exit *ExitError
+	require.ErrorAs(t, err, &exit)
+	assert.Equal(t, ExitInputError, exit.Code)
+	assert.ErrorContains(t, err, "requires --live")
+}
+
+func TestDogfoodFailureExitAfterReport(t *testing.T) {
+	assert.Equal(t, "0", newDogfoodCmd().Annotations["pp:typed-exit-codes"])
+	for _, asJSON := range []bool{false, true} {
+		t.Run(fmt.Sprintf("json=%t", asJSON), func(t *testing.T) {
+			dir := writeDogfoodFailFixture(t)
+			cmd := newDogfoodCmd()
+			args := []string{"--dir", dir}
+			if asJSON {
+				args = append(args, "--json")
+			}
+			cmd.SetArgs(args)
+			out, err := runWithCapturedStdout(t, cmd.Execute)
+			var exit *ExitError
+			require.ErrorAs(t, err, &exit, out)
+			assert.Equal(t, ExitGenerationError, exit.Code)
+			assert.True(t, exit.Silent)
+			assert.Contains(t, out, pipeline.DogfoodVerdictFail)
+			if asJSON {
+				var report pipeline.DogfoodReport
+				require.NoError(t, json.Unmarshal([]byte(out), &report))
+				assert.Equal(t, pipeline.DogfoodVerdictFail, report.Verdict)
+			}
+		})
+	}
+}
+
+func TestDogfoodWarningRemainsSuccessful(t *testing.T) {
+	cmd := newDogfoodCmd()
+	cmd.SetArgs([]string{"--dir", t.TempDir(), "--json"})
+	out, err := runWithCapturedStdout(t, cmd.Execute)
+	require.NoError(t, err, out)
+	var report pipeline.DogfoodReport
+	require.NoError(t, json.Unmarshal([]byte(out), &report))
+	assert.Equal(t, pipeline.DogfoodVerdictWarn, report.Verdict)
+}
+
+func writeDogfoodFailFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "internal", "cli"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "internal", "cli", "root.go"), []byte(`package cli
+func unused() { cmd.Flags().StringVar(&flags.first, "first", "", ""); cmd.Flags().StringVar(&flags.second, "second", "", ""); cmd.Flags().StringVar(&flags.third, "third", "", "") }
+`), 0o644))
 	return dir
 }

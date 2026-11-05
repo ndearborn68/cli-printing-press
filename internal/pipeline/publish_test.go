@@ -2,8 +2,13 @@ package pipeline
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
@@ -80,6 +85,78 @@ func TestCopyDir(t *testing.T) {
 	}
 }
 
+func TestCopyDirStripsGitPlumbing(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	dst := filepath.Join(t.TempDir(), "dst")
+	require.NoError(t, os.MkdirAll(src, 0o755))
+
+	// Top-level .git/ from a stray `git init` in a working CLI dir.
+	require.NoError(t, os.MkdirAll(filepath.Join(src, ".git", "objects", "pack"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, ".git", "objects", "pack", "pack-abc.idx"), []byte("idx"), 0o644))
+
+	// Nested .git/ (submodule).
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "vendor", "submod", ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "vendor", "submod", ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "vendor", "submod", "module.go"), []byte("package submod"), 0o644))
+
+	// .gitmodules at the root.
+	require.NoError(t, os.WriteFile(filepath.Join(src, ".gitmodules"), []byte("[submodule \"submod\"]\n\tpath = vendor/submod\n"), 0o644))
+
+	// Legitimate CLI content that must be preserved.
+	require.NoError(t, os.WriteFile(filepath.Join(src, ".gitignore"), []byte("/build\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, ".gitattributes"), []byte("* text=auto\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "main.go"), []byte("package main"), 0o644))
+
+	require.NoError(t, CopyDir(src, dst))
+
+	assert.NoDirExists(t, filepath.Join(dst, ".git"))
+	assert.NoDirExists(t, filepath.Join(dst, "vendor", "submod", ".git"))
+	assert.NoFileExists(t, filepath.Join(dst, ".gitmodules"))
+
+	assert.FileExists(t, filepath.Join(dst, ".gitignore"))
+	assert.FileExists(t, filepath.Join(dst, ".gitattributes"))
+	assert.FileExists(t, filepath.Join(dst, "main.go"))
+	assert.FileExists(t, filepath.Join(dst, "vendor", "submod", "module.go"))
+}
+
+// A worktree-style ".git" can be a regular file pointing at the parent
+// gitdir, or a symlink pointing outside the source tree. CopyDir would
+// otherwise reject the symlink for escaping the source root, defeating the
+// strip. Both shapes must drop silently like the directory shape.
+func TestCopyDirStripsGitFileAndSymlink(t *testing.T) {
+	t.Run("git as regular file", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "src")
+		dst := filepath.Join(t.TempDir(), "dst")
+		require.NoError(t, os.MkdirAll(src, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(src, ".git"), []byte("gitdir: /elsewhere\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(src, "main.go"), []byte("package main"), 0o644))
+
+		require.NoError(t, CopyDir(src, dst))
+
+		assert.NoFileExists(t, filepath.Join(dst, ".git"))
+		assert.FileExists(t, filepath.Join(dst, "main.go"))
+	})
+
+	t.Run("git as external symlink", func(t *testing.T) {
+		root := t.TempDir()
+		src := filepath.Join(root, "src")
+		dst := filepath.Join(root, "dst")
+		require.NoError(t, os.MkdirAll(src, 0o755))
+
+		outside := filepath.Join(root, "real-gitdir")
+		require.NoError(t, os.MkdirAll(outside, 0o755))
+		require.NoError(t, os.Symlink(outside, filepath.Join(src, ".git")))
+		require.NoError(t, os.WriteFile(filepath.Join(src, "main.go"), []byte("package main"), 0o644))
+
+		require.NoError(t, CopyDir(src, dst))
+
+		_, err := os.Lstat(filepath.Join(dst, ".git"))
+		assert.True(t, os.IsNotExist(err), "external .git symlink should be skipped, not copied or rejected")
+		assert.FileExists(t, filepath.Join(dst, "main.go"))
+	})
+}
+
 func TestCopyDirRejectsExternalSymlinks(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -114,6 +191,820 @@ func TestCopyDirRejectsExternalSymlinks(t *testing.T) {
 			assert.ErrorContains(t, err, "points outside source tree")
 		})
 	}
+}
+
+func installCopyDirTestHook(t *testing.T, fn copyDirWalkHook) {
+	t.Helper()
+	t.Cleanup(SetCopyDirWalkHookForTest(fn))
+}
+
+func TestSkipIfVanished(t *testing.T) {
+	t.Parallel()
+
+	denied := &os.PathError{Op: "stat", Path: "secret", Err: fs.ErrPermission}
+	windowsGone := &os.PathError{Op: "GetFileAttributesEx", Path: `\.gotmp`, Err: fs.ErrNotExist}
+
+	tests := []struct {
+		name  string
+		err   error
+		isDir bool
+		want  error
+	}{
+		{name: "nil"},
+		{name: "vanished file", err: fs.ErrNotExist},
+		{name: "vanished directory", err: fs.ErrNotExist, isDir: true, want: filepath.SkipDir},
+		{name: "windows GetFileAttributesEx", err: windowsGone, isDir: true, want: filepath.SkipDir},
+		{name: "permission denied", err: denied, isDir: true, want: denied},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := skipIfVanished(tt.err, tt.isDir)
+			if tt.want == nil {
+				assert.NoError(t, got)
+				return
+			}
+			if errors.Is(tt.want, filepath.SkipDir) {
+				assert.ErrorIs(t, got, filepath.SkipDir)
+				return
+			}
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// backupFreshTree's --force pre-merge copy walks a live output tree. A child
+// that disappears between WalkDir enumeration and stat must not abort the copy.
+func TestCopyDirSkipsVanishedMidWalkEntry(t *testing.T) {
+	t.Run("vanished directory", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "src")
+		dst := filepath.Join(t.TempDir(), "dst")
+		gotmp := filepath.Join(src, ".gotmp")
+		require.NoError(t, os.MkdirAll(filepath.Join(gotmp, "cache"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(gotmp, "cache", "x"), []byte("tmp"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(src, "novel.go"), []byte("package cli\nfunc Novel() {}\n"), 0o644))
+
+		installCopyDirTestHook(t, func(path string, _ fs.DirEntry) {
+			if path == gotmp {
+				require.NoError(t, os.RemoveAll(path))
+			}
+		})
+
+		require.NoError(t, CopyDir(src, dst))
+		assert.FileExists(t, filepath.Join(dst, "novel.go"))
+		got, err := os.ReadFile(filepath.Join(dst, "novel.go"))
+		require.NoError(t, err)
+		assert.Contains(t, string(got), "func Novel()")
+		assert.NoDirExists(t, filepath.Join(dst, ".gotmp"))
+	})
+
+	t.Run("vanished file", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "src")
+		dst := filepath.Join(t.TempDir(), "dst")
+		require.NoError(t, os.MkdirAll(src, 0o755))
+		scratch := filepath.Join(src, "scratch.tmp")
+		require.NoError(t, os.WriteFile(scratch, []byte("tmp"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(src, "keep.txt"), []byte("keep"), 0o644))
+
+		installCopyDirTestHook(t, func(path string, _ fs.DirEntry) {
+			if path == scratch {
+				require.NoError(t, os.Remove(path))
+			}
+		})
+
+		require.NoError(t, CopyDir(src, dst))
+		assert.FileExists(t, filepath.Join(dst, "keep.txt"))
+		assert.NoFileExists(t, filepath.Join(dst, "scratch.tmp"))
+	})
+}
+
+func TestCopyDirFailsWhenSourceRootVanishes(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	dst := filepath.Join(t.TempDir(), "dst")
+	require.NoError(t, os.MkdirAll(src, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "keep.txt"), []byte("keep"), 0o644))
+
+	installCopyDirTestHook(t, func(path string, _ fs.DirEntry) {
+		if path == src {
+			require.NoError(t, os.RemoveAll(src))
+		}
+	})
+
+	err := CopyDir(src, dst)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, fs.ErrNotExist)
+}
+
+func TestCopyDirStillFailsOnUnreadableDirectory(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+
+	src := filepath.Join(t.TempDir(), "src")
+	dst := filepath.Join(t.TempDir(), "dst")
+	secret := filepath.Join(src, "secret")
+	require.NoError(t, os.MkdirAll(secret, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(secret, "x.txt"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "keep.txt"), []byte("keep"), 0o644))
+	require.NoError(t, os.Chmod(secret, 0))
+	t.Cleanup(func() { _ = os.Chmod(secret, 0o755) })
+
+	err := CopyDir(src, dst)
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, fs.ErrNotExist), "permission failures must stay fatal, got %v", err)
+}
+
+func TestCopyFileReportsVanishedSource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		dest string
+	}{
+		{name: "research.json", dest: "research.json"},
+		{name: "patch record", dest: filepath.Join(PatchesDirName, "drop-envelope.json")},
+		{name: "legacy patch index", dest: PatchesIndexFilename},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dst := filepath.Join(t.TempDir(), tt.dest)
+			err := copyFile(filepath.Join(t.TempDir(), filepath.Base(tt.dest)), dst, 0o644)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, fs.ErrNotExist)
+			assert.NoFileExists(t, dst)
+		})
+	}
+}
+
+func TestSetCopyDirWalkHookForTestRestoresPrevious(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	require.NoError(t, os.MkdirAll(src, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "keep.txt"), []byte("keep"), 0o644))
+
+	var hits []string
+	clearOuter := SetCopyDirWalkHookForTest(func(string, fs.DirEntry) { hits = append(hits, "outer") })
+	t.Cleanup(func() { copyDirTestHook.Store(nil) })
+	clearInner := SetCopyDirWalkHookForTest(func(string, fs.DirEntry) { hits = append(hits, "inner") })
+
+	require.NoError(t, CopyDir(src, filepath.Join(t.TempDir(), "inner")))
+	assert.NotContains(t, hits, "outer")
+	assert.Contains(t, hits, "inner")
+
+	clearInner()
+	hits = nil
+	require.NoError(t, CopyDir(src, filepath.Join(t.TempDir(), "outer")))
+	assert.Contains(t, hits, "outer")
+	assert.NotContains(t, hits, "inner")
+
+	clearOuter()
+	hits = nil
+	require.NoError(t, CopyDir(src, filepath.Join(t.TempDir(), "none")))
+	assert.Empty(t, hits)
+}
+
+func TestSetCopyDirWalkHookForTestEarlierCleanupDoesNotClobberLater(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	require.NoError(t, os.MkdirAll(src, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "keep.txt"), []byte("keep"), 0o644))
+
+	var hits []string
+	clearFirst := SetCopyDirWalkHookForTest(func(string, fs.DirEntry) { hits = append(hits, "first") })
+	clearSecond := SetCopyDirWalkHookForTest(func(string, fs.DirEntry) { hits = append(hits, "second") })
+	t.Cleanup(func() { copyDirTestHook.Store(nil) })
+
+	clearFirst()
+	require.NoError(t, CopyDir(src, filepath.Join(t.TempDir(), "dst")))
+	assert.NotContains(t, hits, "first")
+	assert.Contains(t, hits, "second")
+
+	clearSecond()
+}
+
+func TestCopyPublishableManuscriptDirFiltersSymlinks(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	dst := filepath.Join(t.TempDir(), "dst")
+	require.NoError(t, os.MkdirAll(src, 0o755))
+
+	require.NoError(t, os.WriteFile(filepath.Join(src, "notes.txt"), []byte("notes"), 0o644))
+	require.NoError(t, os.Symlink("notes.txt", filepath.Join(src, "notes-link.txt")))
+	require.NoError(t, os.Symlink("notes.txt", filepath.Join(src, "capture.har")))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "raw-capture.har"), []byte("cookie: secret"), 0o644))
+	require.NoError(t, os.Symlink("raw-capture.har", filepath.Join(src, "raw-capture-link.txt")))
+
+	largeCapture := filepath.Join(src, "large-capture.bin")
+	largeFile, err := os.Create(largeCapture)
+	require.NoError(t, err)
+	require.NoError(t, largeFile.Truncate(publishableManuscriptMaxCaptureBytes))
+	require.NoError(t, largeFile.Close())
+	require.NoError(t, os.Symlink("large-capture.bin", filepath.Join(src, "large-link.bin")))
+
+	require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+
+	linkInfo, err := os.Lstat(filepath.Join(dst, "notes-link.txt"))
+	require.NoError(t, err)
+	assert.NotZero(t, linkInfo.Mode()&os.ModeSymlink, "ordinary internal symlink should be preserved")
+	assert.FileExists(t, filepath.Join(dst, "notes.txt"))
+	assert.NoFileExists(t, filepath.Join(dst, "capture.har"))
+	assert.NoFileExists(t, filepath.Join(dst, "raw-capture.har"))
+	assert.NoFileExists(t, filepath.Join(dst, "raw-capture-link.txt"))
+	assert.NoFileExists(t, filepath.Join(dst, "large-capture.bin"))
+	assert.NoFileExists(t, filepath.Join(dst, "large-link.bin"))
+}
+
+// TestCopyPublishableManuscriptDirExcludesDownloadedSources ensures a research
+// `sources/` subtree (downloaded third-party reference repos) never ships into a
+// published CLI — it is local research input, not authored manuscript output, and
+// publishing copies of other projects' code is a licensing + secret/PII exposure.
+func TestCopyPublishableManuscriptDirExcludesDownloadedSources(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	dst := filepath.Join(t.TempDir(), "dst")
+
+	// Authored manuscript output that must ship.
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "research"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "brief.md"), []byte("our synthesis"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "proofs"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "proofs", "shipcheck.txt"), []byte("ok"), 0o644))
+
+	// Downloaded third-party reference repos under research/sources/ that must NOT ship.
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "research", "sources", "thirdparty"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "sources", "thirdparty", "lib.py"), []byte("# someone else's code"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "sources", "README.md"), []byte("vendored readme"), 0o644))
+
+	require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+
+	assert.FileExists(t, filepath.Join(dst, "research", "brief.md"))
+	assert.FileExists(t, filepath.Join(dst, "proofs", "shipcheck.txt"))
+	assert.NoDirExists(t, filepath.Join(dst, "research", "sources"))
+	assert.NoFileExists(t, filepath.Join(dst, "research", "sources", "thirdparty", "lib.py"))
+	assert.NoFileExists(t, filepath.Join(dst, "research", "sources", "README.md"))
+}
+
+func TestCopyPublishableManuscriptDirExcludesRawBrowserSniffCaptures(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	dst := filepath.Join(t.TempDir(), "dst")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "discovery", "bundles"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "discovery", "batch-01"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "discovery", "v2", "bundles"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "research", "squire-browser-sniff-spec-samples"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "research"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "proofs"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "proofs", "snapshot.pre-pii-scrub"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "probe-001.json"), []byte(`{"email":"customer@gmail.com"}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "probe_users_show.json"), []byte(`{"email":"customer@gmail.com"}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "batch-01", "probe-002.json"), []byte(`{"email":"customer@gmail.com"}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "capture.har"), []byte("raw har"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "bundles", "app.js"), []byte("window.email='customer@gmail.com'"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "v2", "bundles", "app.js"), []byte("window.email='customer@gmail.com'"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "squire-browser-sniff-spec-samples", "sample.json"), []byte(`{"email":"customer@gmail.com"}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "traffic-analysis.json"), []byte(`{"auth_stripped":true}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "browser-sniff-report.md"), []byte("# Report"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "brief.md"), []byte("our synthesis"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "proofs", "shipcheck.md.pre-pii-scrub"), []byte("customer@gmail.com"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "proofs", "snapshot.pre-pii-scrub", "leak.json"), []byte(`{"email":"customer@gmail.com"}`), 0o644))
+
+	require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+
+	assert.NoFileExists(t, filepath.Join(dst, "discovery", "probe-001.json"))
+	assert.NoFileExists(t, filepath.Join(dst, "discovery", "probe_users_show.json"))
+	assert.NoFileExists(t, filepath.Join(dst, "discovery", "batch-01", "probe-002.json"))
+	assert.NoFileExists(t, filepath.Join(dst, "discovery", "capture.har"))
+	assert.NoDirExists(t, filepath.Join(dst, "discovery", "bundles"))
+	assert.NoDirExists(t, filepath.Join(dst, "discovery", "v2", "bundles"))
+	assert.NoDirExists(t, filepath.Join(dst, "research", "squire-browser-sniff-spec-samples"))
+	assert.FileExists(t, filepath.Join(dst, "discovery", "traffic-analysis.json"))
+	assert.FileExists(t, filepath.Join(dst, "discovery", "browser-sniff-report.md"))
+	assert.FileExists(t, filepath.Join(dst, "research", "brief.md"))
+	assert.NoFileExists(t, filepath.Join(dst, "proofs", "shipcheck.md.pre-pii-scrub"))
+	assert.NoDirExists(t, filepath.Join(dst, "proofs", "snapshot.pre-pii-scrub"))
+}
+
+func TestCopyPublishableManuscriptDirCanIncludeRawBrowserSniffCaptures(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	dst := filepath.Join(t.TempDir(), "dst")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "discovery", "bundles"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "research", "squire-browser-sniff-spec-samples"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "research", "sources", "thirdparty"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "probe-001.json"), []byte(`{"status":"sample"}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "capture.har"), []byte("raw har"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "bundles", "app.js"), []byte("console.log('sample')"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "squire-browser-sniff-spec-samples", "sample.json"), []byte(`{"status":"sample"}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "sources", "thirdparty", "lib.py"), []byte("# third party"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "brief.md.pre-pii-scrub"), []byte("customer@gmail.com"), 0o644))
+	largeFile, err := os.Create(filepath.Join(src, "large-authored-artifact.bin"))
+	require.NoError(t, err)
+	require.NoError(t, largeFile.Truncate(publishableManuscriptMaxCaptureBytes))
+	require.NoError(t, largeFile.Close())
+
+	require.NoError(t, CopyPublishableManuscriptDirWithOptions(src, dst, PublishableManuscriptCopyOptions{IncludeRawCaptures: true}))
+
+	assert.FileExists(t, filepath.Join(dst, "discovery", "probe-001.json"))
+	assert.FileExists(t, filepath.Join(dst, "discovery", "capture.har"))
+	assert.FileExists(t, filepath.Join(dst, "discovery", "bundles", "app.js"))
+	assert.FileExists(t, filepath.Join(dst, "research", "squire-browser-sniff-spec-samples", "sample.json"))
+	assert.NoDirExists(t, filepath.Join(dst, "research", "sources"))
+	assert.NoFileExists(t, filepath.Join(dst, "research", "brief.md.pre-pii-scrub"))
+	assert.NoFileExists(t, filepath.Join(dst, "large-authored-artifact.bin"))
+}
+
+func TestCopyPublishableManuscriptDirAllowlistsDiscoverySummaries(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	writeAllowlistFixture(t, src)
+
+	dst := filepath.Join(t.TempDir(), "dst")
+	require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+	assert.Equal(t, []string{
+		"discovery/ble-analysis.json",
+		"discovery/ble-evidence-redacted.json",
+		"discovery/browser-sniff-report.md",
+		"discovery/browser-sniff-unique-paths.txt",
+		"discovery/crowd-browser-sniff-report.md",
+		"discovery/crowd-sniff-provenance.json",
+		"discovery/device-ble-analysis.json",
+		"discovery/example-traffic-analysis.json",
+		"discovery/notes/extra-report.md",
+		"discovery/traffic-analysis.json",
+		"discovery/traffic-analysis.schema.json",
+		"proofs/notes.txt",
+		"proofs/shipcheck.md",
+		"research/brief.md",
+		"research/captured.json",
+		"research/page.html",
+	}, relTreeFiles(t, dst))
+	assert.NoDirExists(t, filepath.Join(dst, "discovery", "bundles"))
+	assert.NoDirExists(t, filepath.Join(dst, "discovery", "contract"))
+	assert.NoDirExists(t, filepath.Join(dst, "discovery", "oracle-check"))
+	assert.NoDirExists(t, filepath.Join(dst, "discovery", "pdf"))
+	assert.NoDirExists(t, filepath.Join(dst, "discovery", "raw"))
+	assert.NoDirExists(t, filepath.Join(dst, "discovery", "terms"))
+	assert.NoDirExists(t, filepath.Join(dst, "research", "sources"))
+
+	included := filepath.Join(t.TempDir(), "included")
+	require.NoError(t, CopyPublishableManuscriptDirWithOptions(src, included, PublishableManuscriptCopyOptions{IncludeRawCaptures: true}))
+	for _, rel := range discoveryRawCaptureRels() {
+		assert.FileExists(t, filepath.Join(included, filepath.FromSlash(rel)), rel)
+	}
+	assert.FileExists(t, filepath.Join(included, "discovery", "browser-sniff-report.md"))
+	assert.FileExists(t, filepath.Join(included, "discovery", "traffic-analysis.json"))
+	assert.FileExists(t, filepath.Join(included, "research", "page.html"))
+	assert.FileExists(t, filepath.Join(included, "proofs", "notes.txt"))
+	assert.FileExists(t, filepath.Join(included, "research", "captured.json"))
+	assert.NoDirExists(t, filepath.Join(included, "research", "sources"))
+}
+
+func TestCopyPublishableManuscriptDirDiscoveryRootUsesAllowlist(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "discovery")
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "contract", "out-01"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "browser-sniff-report.md"), []byte("# report\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "traffic-analysis.json"), []byte("{}\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "contract", "out-01", "sample.body"), []byte("body\n"), 0o644))
+
+	dst := filepath.Join(t.TempDir(), "discovery-out")
+	require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+	assert.Equal(t, []string{
+		"browser-sniff-report.md",
+		"traffic-analysis.json",
+	}, relTreeFiles(t, dst))
+}
+
+func TestCopyPublishableManuscriptDirDiscoveryAllowlistIsCaseInsensitive(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	disc := filepath.Join(src, "Discovery")
+	require.NoError(t, os.MkdirAll(disc, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(disc, "Traffic-Analysis.JSON"), []byte("{}\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(disc, "Resp-Entity.JSON"), []byte("raw\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(disc, "Page.HTML"), []byte("<html>"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(disc, "Terms.TXT"), []byte("terms"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research-notes.txt"), []byte("kept\n"), 0o644))
+
+	dst := filepath.Join(t.TempDir(), "dst")
+	require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+	assert.FileExists(t, filepath.Join(dst, "Discovery", "Traffic-Analysis.JSON"))
+	assert.NoFileExists(t, filepath.Join(dst, "Discovery", "Resp-Entity.JSON"))
+	assert.NoFileExists(t, filepath.Join(dst, "Discovery", "Page.HTML"))
+	assert.NoFileExists(t, filepath.Join(dst, "Discovery", "Terms.TXT"))
+	assert.FileExists(t, filepath.Join(dst, "research-notes.txt"))
+}
+
+func TestCopyPublishableManuscriptDirDiscoveryBypasses(t *testing.T) {
+	t.Run("symlink allowed name and research alias", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "src")
+		disc := filepath.Join(src, "discovery")
+		research := filepath.Join(src, "research")
+		require.NoError(t, os.MkdirAll(disc, 0o755))
+		require.NoError(t, os.MkdirAll(research, 0o755))
+		raw := []byte("raw-response\n")
+		require.NoError(t, os.WriteFile(filepath.Join(disc, "resp-entitydetail.json"), raw, 0o644))
+		require.NoError(t, os.Symlink("resp-entitydetail.json", filepath.Join(disc, "browser-sniff-report.md")))
+		require.NoError(t, os.Symlink(filepath.Join("..", "discovery", "resp-entitydetail.json"), filepath.Join(research, "alias.json")))
+		require.NoError(t, os.WriteFile(filepath.Join(disc, "notes.md"), []byte("# notes\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(research, "brief.md"), []byte("# brief\n"), 0o644))
+
+		dst := filepath.Join(t.TempDir(), "dst")
+		require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+		assert.Equal(t, []string{
+			"discovery/notes.md",
+			"research/brief.md",
+		}, relTreeFiles(t, dst))
+		got, err := os.ReadFile(filepath.Join(dst, "discovery", "notes.md"))
+		require.NoError(t, err)
+		assert.NotContains(t, string(got), "raw-response")
+	})
+
+	t.Run("hard link under another name", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "src")
+		disc := filepath.Join(src, "discovery")
+		research := filepath.Join(src, "research")
+		sources := filepath.Join(research, "sources")
+		require.NoError(t, os.MkdirAll(disc, 0o755))
+		require.NoError(t, os.MkdirAll(sources, 0o755))
+		rawPath := filepath.Join(disc, "resp-entitydetail.json")
+		require.NoError(t, os.WriteFile(rawPath, []byte("raw-response\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(sources, "lib.py"), []byte("third-party\n"), 0o644))
+		if err := os.Link(rawPath, filepath.Join(research, "linked.json")); err != nil {
+			t.Skip("hard links are not supported here")
+		}
+		require.NoError(t, os.Link(rawPath, filepath.Join(disc, "traffic-analysis.json")))
+		require.NoError(t, os.Link(filepath.Join(sources, "lib.py"), filepath.Join(research, "from-sources.py")))
+		require.NoError(t, os.WriteFile(filepath.Join(research, "brief.md"), []byte("# brief\n"), 0o644))
+
+		dst := filepath.Join(t.TempDir(), "dst")
+		require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+		assert.Equal(t, []string{"research/brief.md"}, relTreeFiles(t, dst))
+	})
+
+	t.Run("directory named like a report", func(t *testing.T) {
+		src := filepath.Join(t.TempDir(), "src")
+		nested := filepath.Join(src, "discovery", "browser-sniff-report.md")
+		require.NoError(t, os.MkdirAll(nested, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(nested, "secret.json"), []byte("raw-response\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(src, "discovery", "real-report.md"), []byte("# real\n"), 0o644))
+
+		dst := filepath.Join(t.TempDir(), "dst")
+		require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+		assert.Equal(t, []string{"discovery/real-report.md"}, relTreeFiles(t, dst))
+		assert.NoDirExists(t, filepath.Join(dst, "discovery", "browser-sniff-report.md"))
+	})
+}
+
+func TestCopyPublishableManuscriptDirIgnoresDiscoveryAncestors(t *testing.T) {
+	run := filepath.Join(t.TempDir(), "discovery", "manuscripts", "discovery", "20260329-100000")
+	require.NoError(t, os.MkdirAll(filepath.Join(run, "proofs"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(run, "research"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(run, "discovery"), 0o755))
+	acceptance := []byte("{\"status\":\"pass\"}\n")
+	skipMarker := []byte("{\"status\":\"skip\"}\n")
+	require.NoError(t, os.WriteFile(filepath.Join(run, "proofs", Phase5AcceptanceFilename), acceptance, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(run, "proofs", Phase5SkipFilename), skipMarker, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(run, "research", "page.html"), []byte("<html>kept</html>\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(run, "research", "brief.md"), []byte("# brief\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(run, "discovery", "resp-entitydetail.json"), []byte("raw\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(run, "discovery", "browser-sniff-report.md"), []byte("# report\n"), 0o644))
+
+	dst := filepath.Join(t.TempDir(), "dst")
+	require.NoError(t, CopyPublishableManuscriptDir(run, dst))
+	got, err := os.ReadFile(filepath.Join(dst, "proofs", Phase5AcceptanceFilename))
+	require.NoError(t, err)
+	assert.Equal(t, acceptance, got)
+	got, err = os.ReadFile(filepath.Join(dst, "proofs", Phase5SkipFilename))
+	require.NoError(t, err)
+	assert.Equal(t, skipMarker, got)
+	assert.FileExists(t, filepath.Join(dst, "research", "page.html"))
+	assert.FileExists(t, filepath.Join(dst, "research", "brief.md"))
+	assert.NoFileExists(t, filepath.Join(dst, "discovery", "resp-entitydetail.json"))
+	assert.FileExists(t, filepath.Join(dst, "discovery", "browser-sniff-report.md"))
+
+	// Archive and promote copy proofs/ on its own. The absolute path still
+	// contains a discovery component, and the markers must still ship.
+	proofsDst := filepath.Join(t.TempDir(), "proofs-out")
+	require.NoError(t, CopyPublishableManuscriptDir(filepath.Join(run, "proofs"), proofsDst))
+	got, err = os.ReadFile(filepath.Join(proofsDst, Phase5AcceptanceFilename))
+	require.NoError(t, err)
+	assert.Equal(t, acceptance, got)
+	got, err = os.ReadFile(filepath.Join(proofsDst, Phase5SkipFilename))
+	require.NoError(t, err)
+	assert.Equal(t, skipMarker, got)
+}
+
+func TestSkippedFileIdentityIndexesHardLinks(t *testing.T) {
+	dir := t.TempDir()
+	original := filepath.Join(dir, "resp-entitydetail.json")
+	require.NoError(t, os.WriteFile(original, []byte("raw-response\n"), 0o644))
+	linked := filepath.Join(dir, "linked.json")
+	if err := os.Link(original, linked); err != nil {
+		t.Skip("hard links are not supported here")
+	}
+	other := filepath.Join(dir, "brief.md")
+	require.NoError(t, os.WriteFile(other, []byte("raw-response\n"), 0o644))
+
+	info, err := os.Lstat(original)
+	require.NoError(t, err)
+	var skipped skippedFiles
+	skipped.add(original, info)
+
+	linkedInfo, err := os.Lstat(linked)
+	require.NoError(t, err)
+	assert.True(t, skipped.contains(linked, linkedInfo))
+	otherInfo, err := os.Lstat(other)
+	require.NoError(t, err)
+	assert.False(t, skipped.contains(other, otherInfo))
+
+	originalID, ok := fileIdentityOf(original, info)
+	require.True(t, ok)
+	linkedID, ok := fileIdentityOf(linked, linkedInfo)
+	require.True(t, ok)
+	otherID, ok := fileIdentityOf(other, otherInfo)
+	require.True(t, ok)
+	assert.Equal(t, originalID, linkedID)
+	assert.NotEqual(t, originalID, otherID)
+}
+
+func TestArchiveRunArtifactsDropsCrossTreeHardLink(t *testing.T) {
+	home := setPressTestEnv(t)
+	workingDir := filepath.Join(home, "working", "hardlink-pp-cli")
+	require.NoError(t, os.MkdirAll(workingDir, 0o755))
+	state := NewState("hardlink", workingDir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(state.StatePath()), 0o755))
+	require.NoError(t, state.Save())
+	plantCrossTreeHardLink(t, state.ResearchDir(), state.DiscoveryDir())
+	require.NoError(t, os.MkdirAll(state.ProofsDir(), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(state.ProofsDir(), Phase5AcceptanceFilename), []byte("{\"status\":\"pass\"}\n"), 0o644))
+
+	_, err := ArchiveRunArtifacts(state)
+	require.NoError(t, err)
+	assertCrossTreeHardLinkDropped(t, ArchivedResearchDir(state.APIName, state.RunID), ArchivedDiscoveryDir(state.APIName, state.RunID))
+	assert.FileExists(t, filepath.Join(ArchivedProofsDir(state.APIName, state.RunID), Phase5AcceptanceFilename))
+}
+
+func TestStageRunstateManuscriptsDropsCrossTreeHardLink(t *testing.T) {
+	home := setPressTestEnv(t)
+	workingDir := filepath.Join(home, "working", "stage-hardlink-pp-cli")
+	require.NoError(t, os.MkdirAll(workingDir, 0o755))
+	state := NewStateWithRun("stage-hardlink", workingDir, "run-hardlink", "test-scope")
+	plantCrossTreeHardLink(t, state.ResearchDir(), state.DiscoveryDir())
+	require.NoError(t, os.MkdirAll(state.ProofsDir(), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(state.ProofsDir(), Phase5AcceptanceFilename), []byte("{\"status\":\"pass\"}\n"), 0o644))
+
+	staging := t.TempDir()
+	require.NoError(t, stageRunstateManuscripts(staging, state))
+	manu := filepath.Join(staging, ".manuscripts", state.RunID)
+	assertCrossTreeHardLinkDropped(t, filepath.Join(manu, "research"), filepath.Join(manu, "discovery"))
+	assert.FileExists(t, filepath.Join(manu, "proofs", Phase5AcceptanceFilename))
+}
+
+func TestStageRunstateManuscriptsHardLinkUsesUncopiedDiscovery(t *testing.T) {
+	home := setPressTestEnv(t)
+	workingDir := filepath.Join(home, "working", "stage-existing-pp-cli")
+	require.NoError(t, os.MkdirAll(workingDir, 0o755))
+	state := NewStateWithRun("stage-existing", workingDir, "run-existing", "test-scope")
+	plantCrossTreeHardLink(t, state.ResearchDir(), state.DiscoveryDir())
+
+	staging := t.TempDir()
+	preexisting := filepath.Join(staging, ".manuscripts", state.RunID, "discovery")
+	require.NoError(t, os.MkdirAll(preexisting, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(preexisting, "kept.txt"), []byte("preexisting\n"), 0o644))
+
+	require.NoError(t, stageRunstateManuscripts(staging, state))
+	manu := filepath.Join(staging, ".manuscripts", state.RunID)
+	assert.NoFileExists(t, filepath.Join(manu, "research", "linked.json"))
+	brief, err := os.ReadFile(filepath.Join(manu, "research", "brief.md"))
+	require.NoError(t, err)
+	assert.Equal(t, "# brief\n", string(brief))
+	kept, err := os.ReadFile(filepath.Join(preexisting, "kept.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "preexisting\n", string(kept))
+	assert.NoFileExists(t, filepath.Join(preexisting, "resp-entitydetail.json"))
+}
+
+func plantCrossTreeHardLink(t *testing.T, researchDir, discoveryDir string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(researchDir, 0o755))
+	require.NoError(t, os.MkdirAll(discoveryDir, 0o755))
+	rawPath := filepath.Join(discoveryDir, "resp-entitydetail.json")
+	require.NoError(t, os.WriteFile(rawPath, []byte("raw-response\n"), 0o644))
+	if err := os.Link(rawPath, filepath.Join(researchDir, "linked.json")); err != nil {
+		t.Skip("hard links are not supported here")
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(researchDir, "brief.md"), []byte("# brief\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(discoveryDir, "browser-sniff-report.md"), []byte("# report\n"), 0o644))
+}
+
+func assertCrossTreeHardLinkDropped(t *testing.T, researchDir, discoveryDir string) {
+	t.Helper()
+	assert.NoFileExists(t, filepath.Join(researchDir, "linked.json"))
+	assert.NoFileExists(t, filepath.Join(discoveryDir, "resp-entitydetail.json"))
+	brief, err := os.ReadFile(filepath.Join(researchDir, "brief.md"))
+	require.NoError(t, err)
+	assert.Equal(t, "# brief\n", string(brief))
+	report, err := os.ReadFile(filepath.Join(discoveryDir, "browser-sniff-report.md"))
+	require.NoError(t, err)
+	assert.Equal(t, "# report\n", string(report))
+	assert.NotContains(t, string(brief), "raw-response")
+}
+
+func TestPressAuthoredDiscoveryArtifactNames(t *testing.T) {
+	allowed := []string{
+		"browser-sniff-report.md",
+		"Crowd-Browser-Sniff-Report.MD",
+		"notes.md",
+		"traffic-analysis.json",
+		"Traffic-Analysis.JSON",
+		"example-traffic-analysis.json",
+		"traffic-analysis.schema.json",
+		"crowd-sniff-provenance.json",
+		"ble-analysis.json",
+		"device-ble-analysis.json",
+		"ble-evidence-redacted.json",
+		"browser-sniff-unique-paths.txt",
+	}
+	for _, name := range allowed {
+		assert.True(t, isPressAuthoredDiscoveryArtifact(name), name)
+	}
+	denied := []string{
+		"provenance.json",
+		"sniff-urls.txt",
+		"resp-entitydetail.json",
+		"requests-search.json",
+		"direct-response-search.json",
+		"direct-probe-1.json",
+		"browser-sniff-capture.json",
+		"page.html",
+		"PAGE.HTML",
+		"app.js",
+		"sample.body",
+		"r1_body",
+		"General-Terms-of-Use.txt",
+		"share.pdf",
+		"endpoints.json",
+		"traffic-analysis.json.bak",
+		"report.md.json",
+		"resp%2Ejson",
+	}
+	for _, name := range denied {
+		assert.False(t, isPressAuthoredDiscoveryArtifact(name), name)
+	}
+}
+
+func writeAllowlistFixture(t *testing.T, src string) {
+	t.Helper()
+	for _, rel := range append(discoverySummaryRels(), discoveryRawCaptureRels()...) {
+		path := filepath.Join(src, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(rel+"\n"), 0o644))
+	}
+	kept := []string{
+		"research/brief.md",
+		"research/captured.json",
+		"research/page.html",
+		"proofs/shipcheck.md",
+		"proofs/notes.txt",
+	}
+	for _, rel := range kept {
+		path := filepath.Join(src, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(rel+"\n"), 0o644))
+	}
+	vendor := filepath.Join(src, "research", "sources", "thirdparty", "lib.py")
+	require.NoError(t, os.MkdirAll(filepath.Dir(vendor), 0o755))
+	require.NoError(t, os.WriteFile(vendor, []byte("third-party\n"), 0o644))
+}
+
+func discoverySummaryRels() []string {
+	return []string{
+		"discovery/browser-sniff-report.md",
+		"discovery/crowd-browser-sniff-report.md",
+		"discovery/notes/extra-report.md",
+		"discovery/traffic-analysis.json",
+		"discovery/example-traffic-analysis.json",
+		"discovery/traffic-analysis.schema.json",
+		"discovery/crowd-sniff-provenance.json",
+		"discovery/ble-analysis.json",
+		"discovery/device-ble-analysis.json",
+		"discovery/ble-evidence-redacted.json",
+		"discovery/browser-sniff-unique-paths.txt",
+	}
+}
+
+func discoveryRawCaptureRels() []string {
+	return []string{
+		"discovery/resp-entitydetail.json",
+		"discovery/requests-search.json",
+		"discovery/direct-response-search.json",
+		"discovery/direct-probe-search.json",
+		"discovery/browser-sniff-capture.json",
+		"discovery/browser-sniff-capture.har",
+		"discovery/probe-001.json",
+		"discovery/probe_users_show.json",
+		"discovery/page.html",
+		"discovery/app.js",
+		"discovery/bundles/app.js",
+		"discovery/raw/home.html",
+		"discovery/contract/out-01/sample.body",
+		"discovery/oracle-check/r1_body",
+		"discovery/oracle-check/r2_body",
+		"discovery/terms/General-Terms-of-Use.txt",
+		"discovery/pdf/share-pct.pdf",
+		"discovery/corpus-sweep.json",
+		"discovery/session-state.json",
+		"discovery/devtools-help-1.png",
+		"discovery/sniff-urls.txt",
+		"discovery/endpoints.json",
+	}
+}
+
+func relTreeFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var got []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || path == root || d.IsDir() {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		got = append(got, filepath.ToSlash(rel))
+		return nil
+	})
+	require.NoError(t, err)
+	sort.Strings(got)
+	return got
+}
+
+func TestCopyPublishableManuscriptDirOmitsLiveDogfoodTranscripts(t *testing.T) {
+	const leak = "/Users/operator/printing-press/library/example"
+	transcript := []byte(`{"dir":"` + leak + `","output_sample":"balance 12.00"}` + "\n")
+
+	src := filepath.Join(t.TempDir(), "src")
+	proofs := filepath.Join(src, "proofs")
+	pipelineDir := filepath.Join(src, "pipeline", "nested")
+	require.NoError(t, os.MkdirAll(proofs, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "research"), 0o755))
+	require.NoError(t, os.MkdirAll(pipelineDir, 0o755))
+
+	require.NoError(t, os.WriteFile(filepath.Join(src, "research", "brief.md"), []byte("# brief\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, "shipcheck.md"), []byte("# shipcheck\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, Phase5AcceptanceFilename), []byte(`{"status":"pass"}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, Phase5SkipFilename), []byte(`{"status":"skip"}`+"\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, "publish-live-gate.json"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, "publish-live-gate-rerun.json"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, "acme-20260329-100000-publish-live-gate.json"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, "dogfood-results.json"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, "dogfood-results-v2.json"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, "20260829T160251Z-dogfood-results.json"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofs, "Dogfood-Results.JSON"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(pipelineDir, "dogfood-results.json"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "pipeline", "state.json"), []byte(`{"dir":"`+leak+`"}`+"\n"), 0o644))
+	require.NoError(t, os.Symlink("publish-live-gate.json", filepath.Join(proofs, "gate-alias.txt")))
+	require.NoError(t, os.Symlink("pipeline", filepath.Join(src, "pipeline-link")))
+
+	assertCopied := func(t *testing.T, dst string) {
+		t.Helper()
+		assert.FileExists(t, filepath.Join(dst, "research", "brief.md"))
+		assert.FileExists(t, filepath.Join(dst, "proofs", "shipcheck.md"))
+		assert.FileExists(t, filepath.Join(dst, "proofs", Phase5AcceptanceFilename))
+		assert.FileExists(t, filepath.Join(dst, "proofs", Phase5SkipFilename))
+		assert.NoFileExists(t, filepath.Join(dst, "proofs", "publish-live-gate.json"))
+		assert.NoFileExists(t, filepath.Join(dst, "proofs", "publish-live-gate-rerun.json"))
+		assert.NoFileExists(t, filepath.Join(dst, "proofs", "acme-20260329-100000-publish-live-gate.json"))
+		assert.NoFileExists(t, filepath.Join(dst, "proofs", "dogfood-results.json"))
+		assert.NoFileExists(t, filepath.Join(dst, "proofs", "dogfood-results-v2.json"))
+		assert.NoFileExists(t, filepath.Join(dst, "proofs", "20260829T160251Z-dogfood-results.json"))
+		assert.NoFileExists(t, filepath.Join(dst, "proofs", "Dogfood-Results.JSON"))
+		assert.NoFileExists(t, filepath.Join(dst, "proofs", "gate-alias.txt"))
+		assert.NoDirExists(t, filepath.Join(dst, "pipeline"))
+		assert.NoFileExists(t, filepath.Join(dst, "pipeline", "state.json"))
+		assert.NoFileExists(t, filepath.Join(dst, "pipeline", "nested", "dogfood-results.json"))
+		_, err := os.Lstat(filepath.Join(dst, "pipeline-link"))
+		assert.ErrorIs(t, err, os.ErrNotExist)
+
+		var leaked []string
+		walkErr := filepath.WalkDir(dst, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return readErr
+			}
+			if strings.Contains(string(data), leak) {
+				leaked = append(leaked, path)
+			}
+			return nil
+		})
+		require.NoError(t, walkErr)
+		assert.Empty(t, leaked)
+	}
+
+	dst := filepath.Join(t.TempDir(), "dst")
+	require.NoError(t, CopyPublishableManuscriptDir(src, dst))
+	assertCopied(t, dst)
+
+	included := filepath.Join(t.TempDir(), "included")
+	require.NoError(t, CopyPublishableManuscriptDirWithOptions(src, included, PublishableManuscriptCopyOptions{IncludeRawCaptures: true}))
+	assertCopied(t, included)
 }
 
 // publishManifestEnvSetup wires PRINTING_PRESS_HOME/SCOPE/REPO_ROOT to a temp dir
@@ -175,26 +1066,172 @@ func TestWriteCLIManifestForPublish_NovelFeaturesFromSkillFlowResearch(t *testin
 	assert.Equal(t, "today", m.NovelFeatures[1].Command)
 }
 
-func TestWriteCLIManifestForPublishKeepsCatalogDisplayNameOverTitleFallback(t *testing.T) {
+func TestWriteCLIManifestForPublishSynchronizesToolsManifestNovelFeatures(t *testing.T) {
+	_, state := publishManifestEnvSetup(t, "20260427-tools-manifest")
+	require.NoError(t, os.WriteFile(filepath.Join(state.WorkingDir, "spec.yaml"), []byte(`
+name: test-api
+description: Test API
+version: "1.0"
+base_url: https://api.example.com
+auth:
+  type: none
+resources: {}
+`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(state.WorkingDir, ToolsManifestFilename), []byte(`{
+  "api_name": "test-api",
+  "tools": [],
+  "novel_features": [{"name": "Stale", "command": "stale"}]
+}`), 0o644))
+
+	built := []NovelFeature{{Name: "Fresh", Command: "fresh", Description: "Verified feature."}}
+	writeResearchAt(t, RunRoot(state.RunID), &ResearchResult{
+		APIName:            "test-api",
+		NovelFeaturesBuilt: &built,
+	})
+
+	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+
+	cliManifest := readPublishedManifest(t, state.WorkingDir)
+	toolsManifest, err := ReadToolsManifest(state.WorkingDir)
+	require.NoError(t, err)
+	assert.Equal(t, cliManifest.NovelFeatures, toolsManifest.NovelFeatures)
+}
+
+func TestWriteCLIManifestForPublishPreservesGeneratedDescription(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("PRINTING_PRESS_HOME", tmp)
 	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
 	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
 
-	state := NewStateWithRun("producthunt", filepath.Join(tmp, "working", "producthunt-pp-cli"), "20260507-display-name", "test-scope")
+	rich := "Local-first CLI for the Roam HQ API (chat, On-Air events, transcripts, SCIM, webhooks) with offline FTS search and agent-friendly JSON output."
+	state := NewStateWithRun("asana", filepath.Join(tmp, "working", "asana-pp-cli"), "20260521-description", "test-scope")
 	require.NoError(t, os.MkdirAll(state.WorkingDir, 0o755))
+	writeManifest(t, state.WorkingDir, CLIManifest{
+		APIName:     "asana",
+		Description: rich,
+	})
 	require.NoError(t, os.WriteFile(filepath.Join(state.WorkingDir, "spec.yaml"), []byte(`
-openapi: "3.0.0"
-info:
-  title: Producthunt API
-  version: "1.0"
-paths: {}
+name: asana
+description: API-shaped fallback copy.
+cli_description: Spec CLI copy that should not replace generated manifest copy during publish.
+version: "1.0"
+base_url: https://api.example.com
+auth:
+  type: none
+resources: {}
 `), 0o644))
 
 	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
 
 	m := readPublishedManifest(t, state.WorkingDir)
-	assert.Equal(t, "Product Hunt", m.DisplayName)
+	assert.Equal(t, rich, m.Description)
+	assert.False(t, strings.HasSuffix(m.Description, "..."))
+}
+
+func TestWriteCLIManifestForPublishReplacesLiteralEllipsisDescription(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PRINTING_PRESS_HOME", tmp)
+	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
+	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
+
+	state := NewStateWithRun("asana", filepath.Join(tmp, "working", "asana-pp-cli"), "20260521-description", "test-scope")
+	require.NoError(t, os.MkdirAll(state.WorkingDir, 0o755))
+	writeManifest(t, state.WorkingDir, CLIManifest{
+		APIName:     "asana",
+		Description: "Legacy generated description...",
+	})
+	require.NoError(t, os.WriteFile(filepath.Join(state.WorkingDir, "spec.yaml"), []byte(`
+name: asana
+description: API-shaped fallback copy.
+version: "1.0"
+base_url: https://api.example.com
+auth:
+  type: none
+resources:
+  items:
+    description: Items
+    endpoints:
+      list:
+        method: GET
+        path: /items
+        description: List items
+`), 0o644))
+
+	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+
+	m := readPublishedManifest(t, state.WorkingDir)
+	assert.Equal(t, "API-shaped fallback copy.", m.Description)
+	assert.False(t, strings.HasSuffix(m.Description, "..."))
+}
+
+func TestWriteCLIManifestForPublishReplacesLiteralEllipsisDescriptionFromSyntheticSpec(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PRINTING_PRESS_HOME", tmp)
+	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
+	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
+
+	state := NewStateWithRun("synthetic-local", filepath.Join(tmp, "working", "synthetic-local-pp-cli"), "20260521-description", "test-scope")
+	require.NoError(t, os.MkdirAll(state.WorkingDir, 0o755))
+	writeManifest(t, state.WorkingDir, CLIManifest{
+		APIName:     "synthetic-local",
+		Description: "Legacy generated description...",
+	})
+	require.NoError(t, os.WriteFile(filepath.Join(state.WorkingDir, "spec.yaml"), []byte(`
+name: synthetic-local
+description: Synthetic local command line interface description without early punctuation so publish still emits usable metadata after rejecting legacy ellipsis descriptions
+version: "1.0"
+base_url: https://api.example.com
+auth:
+  type: none
+resources: {}
+`), 0o644))
+
+	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+
+	m := readPublishedManifest(t, state.WorkingDir)
+	assert.NotEmpty(t, m.Description)
+	assert.False(t, strings.HasSuffix(m.Description, "..."))
+}
+
+func TestWriteCLIManifestForPublishRebasesAuthEnvAfterNameOverride(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PRINTING_PRESS_HOME", tmp)
+	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
+	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
+
+	state := NewStateWithRun("elevenlabs", filepath.Join(tmp, "working", "elevenlabs-pp-cli"), "20260513-elevenlabs", "test-scope")
+	require.NoError(t, os.MkdirAll(state.WorkingDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(state.WorkingDir, "spec.yaml"), []byte(`
+openapi: "3.1.0"
+info:
+  title: ElevenLabs API Documentation
+  version: "1.0"
+paths:
+  /v1/models:
+    get:
+      operationId: getModels
+      parameters:
+        - name: xi-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: ok
+`), 0o644))
+
+	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+
+	m := readPublishedManifest(t, state.WorkingDir)
+	assert.Equal(t, []string{"ELEVENLABS_API_KEY"}, m.AuthEnvVars)
+	assert.Empty(t, m.AuthKeyURL)
+
+	tools, err := ReadToolsManifest(state.WorkingDir)
+	require.NoError(t, err)
+	assert.Equal(t, "elevenlabs", tools.APIName)
+	assert.Equal(t, "https://api.example.com", tools.BaseURL)
+	assert.Equal(t, []string{"ELEVENLABS_API_KEY"}, tools.Auth.EnvVars)
 }
 
 func TestWriteCLIManifestForPublishPopulatesCategoryFromSpec(t *testing.T) {
@@ -228,8 +1265,100 @@ resources:
 	assert.Equal(t, "travel", m.Category)
 }
 
+func TestWriteCLIManifestForPublishUsesPipelineStateCategory(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PRINTING_PRESS_HOME", tmp)
+	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
+	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
+	stubPromoteGitAttribution(t, "", "")
+
+	state := NewStateWithRun("test-api", filepath.Join(tmp, "working", "test-api-pp-cli"), "20260508-state-cat", "test-scope")
+	state.Category = "ai"
+	require.NoError(t, os.MkdirAll(state.WorkingDir, 0o755))
+
+	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+
+	m := readPublishedManifest(t, state.WorkingDir)
+	assert.Equal(t, "ai", m.Category)
+}
+
+func TestWriteCLIManifestForPublishBackfillsCreatorFromPrinter(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PRINTING_PRESS_HOME", tmp)
+	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
+	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
+	stubPromoteGitAttribution(t, "ignored", "Ignored")
+
+	state := NewStateWithRun("test-api", filepath.Join(tmp, "working", "test-api-pp-cli"), "20260508-creator", "test-scope")
+	require.NoError(t, os.MkdirAll(state.WorkingDir, 0o755))
+	require.NoError(t, WriteCLIManifest(state.WorkingDir, CLIManifest{
+		SchemaVersion: CurrentCLIManifestSchemaVersion,
+		APIName:       "test-api",
+		CLIName:       "test-api-pp-cli",
+		RunID:         state.RunID,
+		Printer:       "qazmataz",
+		PrinterName:   "qazmataz",
+	}))
+
+	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+
+	m := readPublishedManifest(t, state.WorkingDir)
+	require.NotNil(t, m.Creator)
+	assert.Equal(t, "qazmataz", m.Creator.Handle)
+	assert.Equal(t, "qazmataz", m.Creator.Name)
+}
+
+func TestWriteCLIManifestForPublishKeepsExistingCreator(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PRINTING_PRESS_HOME", tmp)
+	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
+	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
+	stubPromoteGitAttribution(t, "tmchow", "Trevin Chow")
+
+	state := NewStateWithRun("test-api", filepath.Join(tmp, "working", "test-api-pp-cli"), "20260508-keep-creator", "test-scope")
+	require.NoError(t, os.MkdirAll(state.WorkingDir, 0o755))
+	require.NoError(t, WriteCLIManifest(state.WorkingDir, CLIManifest{
+		SchemaVersion: CurrentCLIManifestSchemaVersion,
+		APIName:       "test-api",
+		CLIName:       "test-api-pp-cli",
+		RunID:         state.RunID,
+		Creator:       &spec.Person{Handle: "jane-doe", Name: "Jane Doe"},
+		Printer:       "jane-doe",
+		PrinterName:   "Jane Doe",
+	}))
+
+	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+
+	m := readPublishedManifest(t, state.WorkingDir)
+	require.NotNil(t, m.Creator)
+	assert.Equal(t, "jane-doe", m.Creator.Handle)
+}
+
+func TestWriteCLIManifestForPublishWarnsWithoutCategory(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PRINTING_PRESS_HOME", tmp)
+	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
+	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
+	stubPromoteGitAttribution(t, "", "")
+
+	state := NewStateWithRun("test-api", filepath.Join(tmp, "working", "test-api-pp-cli"), "20260508-no-cat", "test-scope")
+	require.NoError(t, os.MkdirAll(state.WorkingDir, 0o755))
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	old := os.Stderr
+	os.Stderr = w
+	writeErr := writeCLIManifestForPublish(state, state.WorkingDir)
+	require.NoError(t, w.Close())
+	os.Stderr = old
+	require.NoError(t, writeErr)
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	assert.Contains(t, string(buf), "without a public-library category")
+}
+
 // TestWriteCLIManifestForPublish_NovelFeaturesFromPrintFlowResearch covers the
-// printing-press print flow: research.json lives at <RunRoot>/pipeline/research.json
+// cli-printing-press print flow: research.json lives at <RunRoot>/pipeline/research.json
 // alongside phase artifacts. The fallback path keeps print-flow CLIs working.
 func TestWriteCLIManifestForPublish_NovelFeaturesFromPrintFlowResearch(t *testing.T) {
 	_, state := publishManifestEnvSetup(t, "20260427-print-flow")
@@ -311,12 +1440,18 @@ func TestWriteCLIManifestForPublish_NovelFeaturesPreservedFromCarryForward(t *te
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(state.WorkingDir, CLIManifestFilename), existingData, 0o644))
 
-	// No research.json anywhere. Publish should preserve the carry-forward value.
-	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+	// No research.json anywhere. Publish should preserve the carry-forward value
+	// without warning that manual enrichment is required.
+	var stderr string
+	require.NoError(t, captureStderr(t, &stderr, func() error {
+		return writeCLIManifestForPublish(state, state.WorkingDir)
+	}))
 
 	m := readPublishedManifest(t, state.WorkingDir)
 	require.Len(t, m.NovelFeatures, 1, "carry-forward should preserve generate-time novel_features")
 	assert.Equal(t, "today", m.NovelFeatures[0].Command)
+	assert.NotContains(t, stderr, "manifest will require manual enrichment before publish")
+	assert.Contains(t, stderr, "preserving existing novel_features")
 }
 
 func TestWriteCLIManifestForPublish_AuthEnvVarSpecsPreservedFromCarryForward(t *testing.T) {
@@ -421,8 +1556,51 @@ func TestWriteCLIManifestForPublish_NoResearchNoExistingManifest(t *testing.T) {
 	_, state := publishManifestEnvSetup(t, "20260427-empty-everything")
 
 	// No research.json, no existing manifest in WorkingDir.
-	require.NoError(t, writeCLIManifestForPublish(state, state.WorkingDir))
+	var stderr string
+	require.NoError(t, captureStderr(t, &stderr, func() error {
+		return writeCLIManifestForPublish(state, state.WorkingDir)
+	}))
 
 	m := readPublishedManifest(t, state.WorkingDir)
 	assert.Empty(t, m.NovelFeatures, "no novel_features when neither research nor prior manifest has any")
+	assert.Contains(t, stderr, "warning: could not locate originating run's research.json at "+
+		filepath.Join(state.RunRoot(), "research.json")+" or "+
+		filepath.Join(state.PipelineDir(), "research.json"))
+	assert.Contains(t, stderr, "manifest will require manual enrichment before publish")
+	assert.NotContains(t, stderr, "read failed")
+	assert.NotContains(t, stderr, "failed to parse")
+}
+
+func TestWriteCLIManifestForPublishReportsMalformedResearchJSON(t *testing.T) {
+	_, state := publishManifestEnvSetup(t, "20260427-bad-research")
+
+	runRoot := RunRoot(state.RunID)
+	require.NoError(t, os.MkdirAll(runRoot, 0o755))
+	path := filepath.Join(runRoot, "research.json")
+	body := []byte(`{"api_name":"test-api","novel_features":[{"name":1}]}`)
+	require.NoError(t, os.WriteFile(path, body, 0o644))
+
+	var stderr string
+	require.NoError(t, captureStderr(t, &stderr, func() error {
+		return writeCLIManifestForPublish(state, state.WorkingDir)
+	}))
+
+	assert.Contains(t, stderr, "debug: research.json at "+path+" failed to parse:")
+	assert.NotContains(t, stderr, "research.json not found at")
+}
+
+func TestWriteCLIManifestForPublishReportsUnreadableResearchJSON(t *testing.T) {
+	_, state := publishManifestEnvSetup(t, "20260427-unreadable-research")
+
+	runRoot := RunRoot(state.RunID)
+	path := filepath.Join(runRoot, "research.json")
+	require.NoError(t, os.MkdirAll(path, 0o755))
+
+	var stderr string
+	require.NoError(t, captureStderr(t, &stderr, func() error {
+		return writeCLIManifestForPublish(state, state.WorkingDir)
+	}))
+
+	assert.Contains(t, stderr, "debug: research.json at "+path+" read failed:")
+	assert.NotContains(t, stderr, "research.json not found at")
 }

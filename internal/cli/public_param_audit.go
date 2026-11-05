@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mvanhorn/cli-printing-press/v4/internal/graphql"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/openapi"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/pipeline"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
@@ -17,6 +16,7 @@ func newPublicParamAuditCmd() *cobra.Command {
 	var specFiles []string
 	var cliName string
 	var lenient bool
+	var strictRefs bool
 	var ledgerPath string
 	var asJSON bool
 	var strict bool
@@ -29,14 +29,17 @@ wire names are suspicious public CLI/MCP names, such as one-letter or
 punctuation-heavy names. The deterministic inventory is reconciled with an
 optional agent-edited ledger. Strict mode fails until every finding has either
 a real flag_name in the spec or an evidence-backed skip decision in the ledger.`,
-		Example: `  printing-press public-param-audit --spec ./spec.yaml
-  printing-press public-param-audit --spec ./spec.yaml --ledger ./public-param-audit.json --strict`,
+		Example: `  cli-printing-press public-param-audit --spec ./spec.yaml
+  cli-printing-press public-param-audit --spec ./spec.yaml --ledger ./public-param-audit.json --strict`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(specFiles) == 0 {
 				return &ExitError{Code: ExitInputError, Err: fmt.Errorf("--spec is required")}
 			}
 
-			apiSpec, err := parsePublicParamAuditSpec(specFiles, cliName, lenient)
+			apiSpec, err := parsePublicParamAuditSpec(specFiles, cliName, openapi.ParseOptions{
+				Lenient:    lenient,
+				StrictRefs: strictRefs,
+			})
 			if err != nil {
 				return err
 			}
@@ -77,13 +80,14 @@ a real flag_name in the spec or an evidence-backed skip decision in the ledger.`
 	cmd.Flags().StringSliceVar(&specFiles, "spec", nil, "Path or URL to API spec (can be repeated)")
 	cmd.Flags().StringVar(&cliName, "name", "", "CLI name (required when using multiple specs)")
 	cmd.Flags().BoolVar(&lenient, "lenient", false, "Skip validation errors from broken $refs in OpenAPI specs")
+	cmd.Flags().BoolVar(&strictRefs, "strict-refs", false, "Disable lenient stubbing for missing local schema refs (only meaningful with --lenient)")
 	cmd.Flags().StringVar(&ledgerPath, "ledger", "", "Path to an agent-edited public parameter audit ledger")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "emit JSON instead of a human-readable summary")
 	cmd.Flags().BoolVar(&strict, "strict", false, "fail when unresolved findings remain")
 	return cmd
 }
 
-func parsePublicParamAuditSpec(specFiles []string, cliName string, lenient bool) (*spec.APISpec, error) {
+func parsePublicParamAuditSpec(specFiles []string, cliName string, opts openapi.ParseOptions) (*spec.APISpec, error) {
 	var specs []*spec.APISpec
 	for _, specFile := range specFiles {
 		data, err := readSpec(specFile, false, true)
@@ -91,14 +95,7 @@ func parsePublicParamAuditSpec(specFiles []string, cliName string, lenient bool)
 			return nil, &ExitError{Code: ExitSpecError, Err: fmt.Errorf("reading spec %s: %w", specFile, err)}
 		}
 
-		var apiSpec *spec.APISpec
-		if openapi.IsOpenAPI(data) {
-			apiSpec, err = parseOpenAPISpec(specFile, data, lenient)
-		} else if graphql.IsGraphQLSDL(data) {
-			apiSpec, err = graphql.ParseSDLBytes(specFile, data)
-		} else {
-			apiSpec, err = spec.ParseBytes(data)
-		}
+		apiSpec, err := parseSpecBytes(specFile, data, opts)
 		if err != nil {
 			return nil, &ExitError{Code: ExitSpecError, Err: fmt.Errorf("parsing spec %s: %w", specFile, err)}
 		}
@@ -108,6 +105,7 @@ func parsePublicParamAuditSpec(specFiles []string, cliName string, lenient bool)
 	if len(specs) == 1 {
 		if cliName != "" {
 			specs[0].Name = cliName
+			specs[0].ApplyOmittedConfigDefaults()
 		}
 		return specs[0], nil
 	}

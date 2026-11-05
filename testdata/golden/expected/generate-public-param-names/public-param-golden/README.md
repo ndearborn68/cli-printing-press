@@ -2,22 +2,34 @@
 
 Public parameter name golden fixture
 
-Printed by [@printing-press-golden](https://github.com/printing-press-golden) (printing-press-golden).
+Created by [@printing-press-golden](https://github.com/printing-press-golden) (printing-press-golden).
 
 ## Install
 
-The recommended path installs both the `public-param-golden-pp-cli` binary and the `pp-public-param-golden` agent skill in one shot:
+The recommended path installs both the `public-param-golden-pp-cli` binary and the `pp-public-param-golden` agent skill (Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot, and other agents supported by the upstream [`skills`](https://github.com/vercel-labs/skills) CLI) in one shot:
 
 ```bash
-npx -y @mvanhorn/printing-press install public-param-golden
+npx -y @mvanhorn/printing-press-library install public-param-golden
 ```
 
 For CLI only (no skill):
 
 ```bash
-npx -y @mvanhorn/printing-press install public-param-golden --cli-only
+npx -y @mvanhorn/printing-press-library install public-param-golden --cli-only
 ```
 
+For skill only — installs the skill into the same agents as the default command above, but skips the CLI binary (use this to update or reinstall just the skill):
+
+```bash
+npx -y @mvanhorn/printing-press-library install public-param-golden --skill-only
+```
+
+To constrain the skill install to one or more specific agents (repeatable — agent names match the [`skills`](https://github.com/vercel-labs/skills) CLI):
+
+```bash
+npx -y @mvanhorn/printing-press-library install public-param-golden --agent claude-code
+npx -y @mvanhorn/printing-press-library install public-param-golden --agent claude-code --agent codex
+```
 
 ### Without Node
 
@@ -29,6 +41,14 @@ Download a pre-built binary for your platform from the [latest release](https://
 
 <!-- pp-hermes-install-anchor -->
 ## Install for Hermes
+
+Install the CLI binary first. The installer writes binaries to a per-user managed bin directory by default: `$HOME/.local/bin` on macOS/Linux and `%LOCALAPPDATA%\Programs\PrintingPress\bin` on Windows.
+
+```bash
+npx -y @mvanhorn/printing-press-library install public-param-golden --cli-only
+```
+
+Then install the focused Hermes skill.
 
 From the Hermes CLI:
 
@@ -42,107 +62,16 @@ Inside a Hermes chat session:
 /skills install mvanhorn/printing-press-library/cli-skills/pp-public-param-golden --force
 ```
 
+Restart the Hermes session or gateway if the newly installed skill is not visible immediately.
+
 ## Install for OpenClaw
-
-Tell your OpenClaw agent (copy this):
-
-```
-Install the pp-public-param-golden skill from https://github.com/mvanhorn/printing-press-library/tree/main/cli-skills/pp-public-param-golden. The skill defines how its required CLI can be installed.
-```
-
-## Quick Start
-
-### 1. Install
-
-See [Install](#install) above.
-
-### 2. Verify Setup
+Install both the CLI binary and the focused OpenClaw skill. The installer defaults binaries to a per-user bin directory (`$HOME/.local/bin` on macOS/Linux, `%LOCALAPPDATA%\Programs\PrintingPress\bin` on Windows):
 
 ```bash
-public-param-golden-pp-cli doctor
+npx -y @mvanhorn/printing-press-library install public-param-golden --agent openclaw
 ```
 
-This checks your configuration.
-
-### 3. Try Your First Command
-
-```bash
-public-param-golden-pp-cli stores create --store-code example-value
-```
-
-## Usage
-
-Run `public-param-golden-pp-cli --help` for the full command reference and flag list.
-
-## Commands
-
-### stores
-
-Store lookup operations
-
-- **`public-param-golden-pp-cli stores create`** - Create a store record
-- **`public-param-golden-pp-cli stores find`** - Find nearby stores by address
-
-
-## Output Formats
-
-```bash
-# Human-readable table (default in terminal, JSON when piped)
-public-param-golden-pp-cli stores create --store-code example-value
-
-# JSON for scripting and agents
-public-param-golden-pp-cli stores create --store-code example-value --json
-
-# Filter to specific fields
-public-param-golden-pp-cli stores create --store-code example-value --json --select id,name,status
-
-# Dry run — show the request without sending
-public-param-golden-pp-cli stores create --store-code example-value --dry-run
-
-# Agent mode — JSON + compact + no prompts in one flag
-public-param-golden-pp-cli stores create --store-code example-value --agent
-```
-
-## Agent Usage
-
-This CLI is designed for AI agent consumption:
-
-- **Non-interactive** - never prompts, every input is a flag
-- **Pipeable** - `--json` output to stdout, errors to stderr
-- **Filterable** - `--select id,name` returns only fields you need
-- **Previewable** - `--dry-run` shows the request without sending
-- **Explicit retries** - add `--idempotent` to create retries when a no-op success is acceptable
-- **Confirmable** - `--yes` for explicit confirmation of destructive actions
-- **Piped input** - write commands can accept structured input when their help lists `--stdin`
-- **Agent-safe by default** - no colors or formatting unless `--human-friendly` is set
-
-Exit codes: `0` success, `2` usage error, `3` not found, `5` API error, `7` rate limited, `10` config error.
-
-## Use with Claude Code
-
-Install the focused skill — it auto-installs the CLI on first invocation:
-
-```bash
-npx skills add mvanhorn/printing-press-library/cli-skills/pp-public-param-golden -g
-```
-
-Then invoke `/pp-public-param-golden <query>` in Claude Code. The skill is the most efficient path — Claude Code drives the CLI directly without an MCP server in the middle.
-
-<details>
-<summary>Use as an MCP server in Claude Code (advanced)</summary>
-
-If you'd rather register this CLI as an MCP server in Claude Code, install the MCP binary first:
-
-
-Install the MCP binary from this CLI's published public-library entry or pre-built release.
-
-Then register it:
-
-```bash
-claude mcp add public-param-golden public-param-golden-pp-mcp
-```
-
-</details>
+Restart the OpenClaw session or gateway if the newly installed skill is not visible immediately.
 
 ## Use with Claude Desktop
 
@@ -163,7 +92,7 @@ If you can't use the MCPB bundle (older Claude Desktop, unsupported platform), i
 
 Install the MCP binary from this CLI's published public-library entry or pre-built release.
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
@@ -177,6 +106,172 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 </details>
 
+### Remote MCP over HTTP
+
+`public-param-golden-pp-mcp --transport http` (or `PP_MCP_TRANSPORT=http`) serves streamable HTTP at `http://127.0.0.1:7777/mcp`. It refuses to start until `PUBLIC_PARAM_GOLDEN_MCP_HTTP_TOKEN` is set to at least 32 characters, and every request must send `Authorization: Bearer <token>`. The command below prints 64 hex characters and meets that minimum. Plain HTTP is allowed only on a loopback `--addr`; any other bind, including `:7777` (every interface), also needs `--tls-cert` and `--tls-key`. Requests with no `Origin` header are accepted, as are loopback origins (`localhost`, `127.0.0.1`, or `[::1]`, any port). Any other `Origin` is refused unless it is listed in `PUBLIC_PARAM_GOLDEN_MCP_HTTP_ALLOWED_ORIGINS`, a comma-separated list of `scheme://host[:port]` values with no path. That list is not a CORS policy; the server does not emit CORS headers.
+
+```bash
+export PUBLIC_PARAM_GOLDEN_MCP_HTTP_TOKEN="$(openssl rand -hex 32)"
+public-param-golden-pp-mcp --transport http
+```
+
+Set `PUBLIC_PARAM_GOLDEN_MCP_READ_ONLY=1` (exactly `1`) to drop mirrored commands that are not marked read-only and make the raw execute tool refuse state-changing calls. Commands marked local-write, which write only this CLI's own learn store, stay available.
+
+## Quick Start
+
+### 1. Install
+
+See [Install](#install) above.
+
+### 2. Verify Setup
+
+```bash
+public-param-golden-pp-cli doctor
+```
+
+This checks your configuration.
+
+### 3. Try Your First Command
+
+```bash
+public-param-golden-pp-cli stores find --address example-value --city example-value --location-id 550e8400-e29b-41d4-a716-446655440000
+```
+
+## Usage
+
+Run `public-param-golden-pp-cli --help` for the full command reference and flag list.
+
+## Paths & environment variables
+
+This CLI separates local files into four path kinds:
+
+| Kind | Contents |
+|------|----------|
+| `config` | User-editable settings such as `config.toml` and saved profiles |
+| `data` | Durable local data such as `data.db` |
+| `state` | Runtime state such as persisted queries, jobs, and `teach.log` |
+| `cache` | Regenerable HTTP/cache files |
+
+Each kind resolves independently. The ladder is:
+
+1. Per-kind env var: `PUBLIC_PARAM_GOLDEN_CONFIG_DIR`, `PUBLIC_PARAM_GOLDEN_DATA_DIR`, `PUBLIC_PARAM_GOLDEN_STATE_DIR`, or `PUBLIC_PARAM_GOLDEN_CACHE_DIR`
+2. `--home <dir>` for this invocation
+3. `PUBLIC_PARAM_GOLDEN_HOME` for a flat relocated root
+4. XDG env vars: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`
+5. Platform defaults matching existing installs
+
+For containers and agent sandboxes, prefer a single relocated root:
+
+```bash
+export PUBLIC_PARAM_GOLDEN_HOME=/srv/public-param-golden
+public-param-golden-pp-cli doctor
+```
+
+Under `PUBLIC_PARAM_GOLDEN_HOME=/srv/public-param-golden`, the four dirs resolve to `/srv/public-param-golden/config`, `/srv/public-param-golden/data`, `/srv/public-param-golden/state`, and `/srv/public-param-golden/cache`.
+
+On Windows, set the same variable in PowerShell:
+
+```powershell
+$env:PUBLIC_PARAM_GOLDEN_HOME = "C:\srv\public-param-golden"
+public-param-golden-pp-cli doctor
+```
+
+Under `$env:PUBLIC_PARAM_GOLDEN_HOME = "C:\srv\public-param-golden"`, the four dirs resolve to `C:\srv\public-param-golden\config`, `C:\srv\public-param-golden\data`, `C:\srv\public-param-golden\state`, and `C:\srv\public-param-golden\cache`.
+
+MCP servers do not receive CLI flags from the host. Put relocation in the host `env` block:
+
+```json
+{
+  "mcpServers": {
+    "public-param-golden": {
+      "command": "public-param-golden-pp-mcp",
+      "env": {
+        "PUBLIC_PARAM_GOLDEN_HOME": "/srv/public-param-golden"
+      }
+    }
+  }
+}
+```
+
+Precedence matters in fleets: an ambient per-kind variable such as `PUBLIC_PARAM_GOLDEN_DATA_DIR` overrides an explicit `--home` for that kind. Use `PUBLIC_PARAM_GOLDEN_HOME` or the per-kind variables for durable fleet relocation; treat `--home` as the weaker per-invocation lever.
+
+Relocation is one-way. Unsetting `PUBLIC_PARAM_GOLDEN_HOME` does not move files back to platform defaults, and `doctor` cannot find files left under a former root. Move the files manually before unsetting relocation variables.
+
+Existing installs keep working because the platform-default rung matches the legacy layout. Run `public-param-golden-pp-cli doctor --fail-on warn` to check path warnings in automation.
+
+### Local data
+
+Reads are saved locally by default: in `--data-source auto` mode every successful read is also written to the SQLite store (`data.db`, or `data-<hash>.db` per credential) in the data directory. GET responses are cached for five minutes under `http/` in the cache directory. The learn journal lives under `learn/` in the state directory. `public-param-golden-pp-cli doctor` prints the resolved paths, every store file, and the response-cache size.
+
+None of it is encrypted. New files are created owner-only; beyond that the data relies on OS account permissions and full-disk encryption (FileVault, BitLocker, LUKS).
+
+- **Erase it:** `public-param-golden-pp-cli local-data purge` lists the store files, response cache, and learn journal it would delete; add `--yes` to delete them, or `--only store|cache|journal` to narrow it. Config and credentials are kept.
+- **Run without a local copy:** set `PUBLIC_PARAM_GOLDEN_NO_LOCAL_DATA=1`. Reads go to the API (`--data-source live`; `--data-source local` still reads an existing store), the response cache is off (`--no-cache`), nothing new is written to the store, and `sync` and `workflow archive` refuse to run. Set it in an MCP host's `env` block and every command the server runs inherits it.
+- **Choose the read source without flags:** `PUBLIC_PARAM_GOLDEN_DATA_SOURCE=auto|live|local` sets the `--data-source` default; an explicit flag wins.
+
+## Commands
+
+### stores
+
+Store lookup operations
+
+- **`public-param-golden-pp-cli stores create`** - Create a store record
+- **`public-param-golden-pp-cli stores find`** - Find nearby stores by address
+
+
+### Self-learning loop
+
+This CLI caches per-question discovery so repeat queries skip the walk and structurally similar queries get answered via entity substitution. The loop also self-captures: every invocation is journaled locally, and failed-flag corrections plus fresh teaches surface as candidates on the next `recall` for confirm/reject judgment. Agents call `recall` before discovery and fire `teach &` after answering. See the `## Automatic learning` section in `SKILL.md` for the full protocol.
+
+- **`public-param-golden-pp-cli recall <query>`** - Look up cached resources for a query before running discovery
+- **`public-param-golden-pp-cli teach`** - Record a query -> resource mapping (silent on success, safe to background with `&`)
+- **`public-param-golden-pp-cli learnings list`** - Inspect taught rows
+- **`public-param-golden-pp-cli learnings forget <query>`** - Undo a teach
+- **`public-param-golden-pp-cli learnings candidates`** - List auto-captured candidates awaiting confirm/reject
+- **`public-param-golden-pp-cli learnings stats`** - Local loop metrics: recall hit rate, teach-to-reuse, playbook resolution, candidate counts
+- **`public-param-golden-pp-cli teach-pattern`** - Install a query/resource template up front
+- **`public-param-golden-pp-cli teach-lookup`** - Add an entity mapping (e.g. country code, team alias) for pattern substitution
+
+Pass `--no-learn` or set `PUBLIC_PARAM_GOLDEN_NO_LEARN=true` to disable the loop for deterministic flows.
+
+The local store's schema version stamp is one-way: once this version of `public-param-golden-pp-cli` opens the database, older binaries refuse it with a version error — upgrade the binary rather than downgrading.
+
+## Output Formats
+
+```bash
+# Human-readable table (default in terminal, JSON when piped)
+public-param-golden-pp-cli stores find --address example-value --city example-value --location-id 550e8400-e29b-41d4-a716-446655440000
+
+# JSON for scripting and agents
+public-param-golden-pp-cli stores find --address example-value --city example-value --location-id 550e8400-e29b-41d4-a716-446655440000 --json
+# Filter to specific fields
+public-param-golden-pp-cli stores find --address example-value --city example-value --location-id 550e8400-e29b-41d4-a716-446655440000 --json --select id,name
+
+# Dry run — show the request without sending
+public-param-golden-pp-cli stores find --address example-value --city example-value --location-id 550e8400-e29b-41d4-a716-446655440000 --dry-run
+
+# Agent mode — JSON + compact + no prompts in one flag
+public-param-golden-pp-cli stores find --address example-value --city example-value --location-id 550e8400-e29b-41d4-a716-446655440000 --agent
+```
+
+`--csv` prefixes a leading `'` on cells and header keys that start with `=`, `+`, `-`, `@`, a tab, or a line break (including fullwidth `＝＋－＠`) so a spreadsheet does not run them as formulas. Plain signed numbers such as `-5` and `+2.5e3` are left unchanged.
+
+## Agent Usage
+
+This CLI is designed for AI agent consumption:
+
+- **Non-interactive** - never prompts, every input is a flag
+- **Pipeable** - `--json` output to stdout, errors to stderr
+- **Filterable** - `--select <field>[,<field>...]` returns only fields you need
+- **Previewable** - `--dry-run` shows the request without sending
+- **Explicit retries** - add `--idempotent` to create retries when a no-op success is acceptable
+- **Explicit confirmation** - `--agent` does not imply `--yes`; pass `--yes` separately only after the target, arguments, and side effects are clear
+- **Piped input** - write commands can accept structured input when their help lists `--stdin`
+- **Offline-friendly** - sync/search commands can use the local SQLite store when available
+- **Agent-safe by default** - no colors or formatting unless `--human-friendly` is set
+
+Exit codes: `0` success, `2` usage error, `3` not found, `5` API error, `6` partial failure, `7` rate limited or blocked, `10` config error.
+
 ## Health Check
 
 ```bash
@@ -187,9 +282,11 @@ Verifies configuration and connectivity to the API.
 
 ## Configuration
 
-Config file: ``
+Run `public-param-golden-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `~/.config/public-param-golden-pp-cli/config.toml` on macOS/Linux and `%USERPROFILE%\.config\public-param-golden-pp-cli\config.toml` on Windows; `--home`, `PUBLIC_PARAM_GOLDEN_HOME`, and per-kind env vars can relocate it.
 
 Static request headers can be configured under `headers`; per-command header overrides take precedence.
+
+`--ca-cert`, `PUBLIC_PARAM_GOLDEN_CA_CERT`, or `ca_cert` adds a PEM CA bundle to the system trust roots. `--tls-server-name`, `PUBLIC_PARAM_GOLDEN_TLS_SERVER_NAME`, or `tls_server_name` is the name checked against the certificate when the dialed address does not match it. Precedence is flag, then environment, then the config file. A config file other users can change does not supply these settings. Certificate verification failures are not retried.
 
 ## Troubleshooting
 **Not found errors (exit code 3)**

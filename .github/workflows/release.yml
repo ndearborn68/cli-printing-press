@@ -15,7 +15,24 @@ permissions:
   pull-requests: write
 
 jobs:
+  go-floor:
+    name: go-floor
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Enforce Go floor against printing-press-library
+        env:
+          GO_FLOOR_ENFORCE_LIBRARY: "1"
+        run: python3 scripts/verify-go-floor.py
+
   release-please:
+    needs: go-floor
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -36,7 +53,7 @@ jobs:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: write
     steps:
@@ -55,6 +72,27 @@ jobs:
       - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
-          args: release --clean
+          args: release --clean --parallelism=1 --timeout=35m
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOMAXPROCS: "2"
+
+      - name: Verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | select(.size > 0) | .name')
+          for os in linux darwin windows; do
+            extension=tar.gz
+            if [ "$os" = windows ]; then extension=zip; fi
+            for arch in amd64 arm64; do
+              expected="cli-printing-press_${os}_${arch}.${extension}"
+              if ! printf '%s\n' "$assets" | grep -Fxq "$expected"; then
+                echo "::error::Release $RELEASE_TAG is missing non-empty asset $expected"
+                exit 1
+              fi
+            done
+          done
+          printf '%s\n' "$assets" | grep -Fx checksums.txt

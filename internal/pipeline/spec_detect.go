@@ -48,6 +48,7 @@ func internalSpecToDogfoodSpec(s *apispec.APISpec) *openAPISpec {
 		HTTPTransport:  s.EffectiveHTTPTransport(),
 		ParamDefaults:  collectInternalSpecParamDefaults(s),
 		IsInternalYAML: true,
+		CLIDescription: s.CLIDescription,
 	}
 }
 
@@ -117,9 +118,11 @@ func stringifyParamDefault(v any) string {
 // the openAPISpecInfo struct used by scorecard.
 func internalSpecToOpenAPISpecInfo(s *apispec.APISpec) *openAPISpecInfo {
 	info := &openAPISpecInfo{
-		Paths:           collectInternalSpecPaths(s),
-		SecuritySchemes: make(map[string]openAPISecurityScheme),
-		Kind:            s.Kind,
+		Paths:                collectInternalSpecPaths(s),
+		SecuritySchemes:      make(map[string]openAPISecurityScheme),
+		PositionalParamCount: countInternalSpecPositionals(s),
+		Kind:                 s.Kind,
+		IsGraphQL:            strings.TrimSpace(s.GraphQLEndpointPath) != "",
 	}
 
 	// Map auth config to a synthetic security scheme so scorecard auth
@@ -134,6 +137,7 @@ func internalSpecToOpenAPISpecInfo(s *apispec.APISpec) *openAPISpecInfo {
 		case "bearer_token":
 			scheme.Type = "http"
 			scheme.Scheme = "bearer"
+			scheme.Prefix = s.Auth.Prefix
 		case "api_key":
 			scheme.Type = "apikey"
 			scheme.In = s.Auth.In
@@ -146,6 +150,7 @@ func internalSpecToOpenAPISpecInfo(s *apispec.APISpec) *openAPISpecInfo {
 		case "cookie", "composed":
 			scheme.Type = "apikey"
 			scheme.In = "cookie"
+			scheme.HeaderName = cookieAuthScoreHeader(s.Auth)
 		default:
 			scheme.Type = s.Auth.Type
 		}
@@ -156,6 +161,43 @@ func internalSpecToOpenAPISpecInfo(s *apispec.APISpec) *openAPISpecInfo {
 	}
 
 	return info
+}
+
+// cookieAuthScoreHeader is the header auth_protocol looks for. Jar-only
+// cookie auth keeps Cookie. Composed auth with an empty header is emitted
+// as Authorization; any other explicit header is stamped under that name.
+func cookieAuthScoreHeader(auth apispec.AuthConfig) string {
+	header := strings.TrimSpace(auth.Header)
+	if strings.EqualFold(auth.Type, "composed") && header == "" {
+		return "Authorization"
+	}
+	if header == "" {
+		return "Cookie"
+	}
+	return header
+}
+
+func countInternalSpecPositionals(s *apispec.APISpec) int {
+	count := 0
+	for _, resource := range s.Resources {
+		count += countInternalResourcePositionals(resource)
+	}
+	return count
+}
+
+func countInternalResourcePositionals(r apispec.Resource) int {
+	count := 0
+	for _, endpoint := range r.Endpoints {
+		for _, param := range endpoint.Params {
+			if param.Positional {
+				count++
+			}
+		}
+	}
+	for _, sub := range r.SubResources {
+		count += countInternalResourcePositionals(sub)
+	}
+	return count
 }
 
 // collectInternalSpecPaths extracts all endpoint paths from an internal YAML spec.

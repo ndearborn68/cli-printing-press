@@ -26,6 +26,83 @@ func TestPlanGoModMergePostmanExplore(t *testing.T) {
 		plan.PreservedModulePath)
 }
 
+func TestPlanGoModMergeTreatsMissingPublishedGoModAsFreshGeneration(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	pubDir := filepath.Join(tmp, "pub")
+	freshDir := filepath.Join(tmp, "fresh")
+	require.NoError(t, os.MkdirAll(pubDir, 0o755))
+	require.NoError(t, os.MkdirAll(freshDir, 0o755))
+	require.NoError(t, writeFileAtomic(filepath.Join(freshDir, "go.mod"), []byte(`module foo-pp-cli
+
+go 1.23.0
+`)))
+
+	plan, err := planGoModMerge(pubDir, freshDir)
+	require.NoError(t, err)
+	assert.Nil(t, plan, "first-time generation has no published go.mod to merge")
+}
+
+func TestPlanGoModMergeStillValidatesPresentGoModWhenOtherSideIsMissing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		writePub    bool
+		pubGoMod    string
+		writeFresh  bool
+		freshGoMod  string
+		wantErrPart string
+	}{
+		{
+			name:        "fresh malformed when published missing",
+			writeFresh:  true,
+			freshGoMod:  "not a module file\n",
+			wantErrPart: "parsing fresh go.mod",
+		},
+		{
+			name:        "published malformed when fresh missing",
+			writePub:    true,
+			pubGoMod:    "not a module file\n",
+			wantErrPart: "parsing published go.mod",
+		},
+		{
+			name:     "published valid when fresh missing",
+			writePub: true,
+			pubGoMod: "module published-cli\n\ngo 1.23\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmp := t.TempDir()
+			pubDir := filepath.Join(tmp, "pub")
+			freshDir := filepath.Join(tmp, "fresh")
+			require.NoError(t, os.MkdirAll(pubDir, 0o755))
+			require.NoError(t, os.MkdirAll(freshDir, 0o755))
+			if tt.writePub {
+				require.NoError(t, writeFileAtomic(filepath.Join(pubDir, "go.mod"), []byte(tt.pubGoMod)))
+			}
+			if tt.writeFresh {
+				require.NoError(t, writeFileAtomic(filepath.Join(freshDir, "go.mod"), []byte(tt.freshGoMod)))
+			}
+
+			plan, err := planGoModMerge(pubDir, freshDir)
+			if tt.wantErrPart != "" {
+				require.Error(t, err)
+				assert.Nil(t, plan)
+				assert.Contains(t, err.Error(), tt.wantErrPart)
+				return
+			}
+			require.NoError(t, err)
+			assert.Nil(t, plan)
+		})
+	}
+}
+
 // TestRenderMergedGoModPreservesPublishedModule confirms the rendered bytes
 // have the published module line, the fresh require versions, and parse
 // cleanly.
@@ -154,4 +231,55 @@ require github.com/spf13/cobra v1.9.1
 		"hand-added sqlite must survive the merge with its published version")
 	assert.Equal(t, "v1.9.1", gotPaths["github.com/spf13/cobra"],
 		"shared deps stay at fresh's version")
+}
+
+// TestRenderMergedGoModFreshWinsEnetxHTTP pins that regen-merge cannot
+// reintroduce github.com/enetx/http v1.0.28 (the Go 1.27 http2 compile
+// break) when the fresh tree floors v1.0.29. Fresh already wins on shared
+// require paths; this case locks that rule to the pin that makes `go install`
+// work on Go 1.27.
+func TestRenderMergedGoModFreshWinsEnetxHTTP(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	pubDir := filepath.Join(tmp, "pub")
+	freshDir := filepath.Join(tmp, "fresh")
+	require.NoError(t, os.MkdirAll(pubDir, 0o755))
+	require.NoError(t, os.MkdirAll(freshDir, 0o755))
+
+	pubGoMod := []byte(`module github.com/example/monorepo/library/foo
+
+go 1.26.10
+
+require (
+	github.com/enetx/http v1.0.28
+	github.com/enetx/http2 v1.0.26
+	github.com/enetx/surf v1.0.199
+)
+`)
+	freshGoMod := []byte(`module foo-pp-cli
+
+go 1.26.10
+
+require (
+	github.com/enetx/http v1.0.29
+	github.com/enetx/http2 v1.0.26
+	github.com/enetx/surf v1.0.199
+)
+`)
+	require.NoError(t, writeFileAtomic(filepath.Join(pubDir, "go.mod"), pubGoMod))
+	require.NoError(t, writeFileAtomic(filepath.Join(freshDir, "go.mod"), freshGoMod))
+
+	bytes, err := renderMergedGoMod(pubDir, freshDir)
+	require.NoError(t, err)
+	parsed, err := modfile.Parse("merged-go.mod", bytes, nil)
+	require.NoError(t, err)
+
+	gotPaths := map[string]string{}
+	for _, req := range parsed.Require {
+		gotPaths[req.Mod.Path] = req.Mod.Version
+	}
+	assert.Equal(t, "v1.0.29", gotPaths["github.com/enetx/http"],
+		"fresh's Go 1.27-compatible enetx/http pin must win over published v1.0.28")
+	assert.Equal(t, "v1.0.26", gotPaths["github.com/enetx/http2"])
 }

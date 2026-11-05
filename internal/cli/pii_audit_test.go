@@ -15,7 +15,7 @@ import (
 
 func TestPIIAuditCmd_RunsAndPersistsLedger(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@example.com"`+"\n")
+	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@gmail.com"`+"\n")
 
 	cmd := newPIIAuditCmd()
 	stdout := &bytes.Buffer{}
@@ -36,7 +36,7 @@ func TestPIIAuditCmd_RunsAndPersistsLedger(t *testing.T) {
 
 func TestPIIAuditCmd_JSON(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@example.com"`+"\n")
+	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@gmail.com"`+"\n")
 
 	cmd := newPIIAuditCmd()
 	stdout := &bytes.Buffer{}
@@ -52,9 +52,59 @@ func TestPIIAuditCmd_JSON(t *testing.T) {
 	assert.Equal(t, artifacts.PIIKindEmail, findings[0].Kind)
 }
 
+func TestPIIAuditCmd_ExcludesGeneratedFixturesAndOMCWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "root_test.go"), `"email": "leak@gmail.com"`+"\n")
+	writeFile(t, filepath.Join(dir, "testdata", "fixtures", "sample.json"), `"email": "leak@gmail.com"`+"\n")
+	writeFile(t, filepath.Join(dir, ".omc", "state.json"), `"email": "leak@gmail.com"`+"\n")
+	writeFile(t, filepath.Join(dir, "config.yaml"), `"email": "leak@gmail.com"`+"\n")
+
+	cmd := newPIIAuditCmd()
+	stdout := &bytes.Buffer{}
+	cmd.SetOut(stdout)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{dir, "--json"})
+
+	require.NoError(t, cmd.Execute())
+
+	var findings []artifacts.PIIFinding
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &findings))
+	require.Len(t, findings, 1)
+	assert.Equal(t, "config.yaml", findings[0].File)
+	assert.Equal(t, artifacts.PIIKindEmail, findings[0].Kind)
+}
+
+func TestPIIAuditCmd_ManuscriptsRunDirUsesStagedPackagePaths(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(t.TempDir(), "manuscripts", "tenderned", "20260517-211252")
+	writeFile(t, filepath.Join(runDir, "research.json"), `{"narrative":{"auth_narrative":"Contact functioneelbeheer@tenderned.nl"}}`+"\n")
+	writeFile(t, filepath.Join(runDir, "research", "brief.md"), "Contact functioneelbeheer@tenderned.nl for API access.\n")
+	writeFile(t, filepath.Join(runDir, "research", "vendor-spec.yaml"), "email: functioneelbeheer@tenderned.nl\n")
+	writeFile(t, filepath.Join(runDir, "proofs", "shipcheck.md"), "Contact functioneelbeheer@tenderned.nl\n")
+
+	cmd := newPIIAuditCmd()
+	stdout := &bytes.Buffer{}
+	cmd.SetOut(stdout)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{dir, "--manuscripts-dir", runDir, "--json"})
+
+	require.NoError(t, cmd.Execute())
+
+	var findings []artifacts.PIIFinding
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &findings))
+	files := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		files = append(files, finding.File)
+	}
+	assert.ElementsMatch(t, []string{
+		".manuscripts/20260517-211252/research.json",
+		".manuscripts/20260517-211252/research/brief.md",
+	}, files)
+}
+
 func TestPIIAuditCmd_StrictExitsNonZeroOnPending(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@example.com"`+"\n")
+	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@gmail.com"`+"\n")
 
 	cmd := newPIIAuditCmd()
 	cmd.SetOut(&bytes.Buffer{})
@@ -70,7 +120,7 @@ func TestPIIAuditCmd_StrictExitsNonZeroOnPending(t *testing.T) {
 
 func TestPIIAuditCmd_StrictPassesWithValidAccepts(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@example.com"`+"\n")
+	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@gmail.com"`+"\n")
 
 	// Run once to populate ledger
 	cmd := newPIIAuditCmd()
@@ -98,7 +148,7 @@ func TestPIIAuditCmd_StrictPassesWithValidAccepts(t *testing.T) {
 
 func TestPIIAuditCmd_StrictFailsOnAcceptMissingCategory(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@example.com"`+"\n")
+	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@gmail.com"`+"\n")
 
 	cmd := newPIIAuditCmd()
 	cmd.SetOut(&bytes.Buffer{})
@@ -126,7 +176,7 @@ func TestPIIAuditCmd_StrictFailsOnAcceptMissingCategory(t *testing.T) {
 
 func TestPIIAuditCmd_AgentFieldsSurviveReRun(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@example.com"`+"\n")
+	writeFile(t, filepath.Join(dir, "data.json"), `"email": "leak@gmail.com"`+"\n")
 
 	// Run once
 	cmd := newPIIAuditCmd()
@@ -170,10 +220,53 @@ func TestPIIAuditCmd_CleanDir(t *testing.T) {
 	require.NoError(t, cmd.Execute())
 
 	assert.Contains(t, stdout.String(), "no findings")
+	assert.Contains(t, stdout.String(), "account-id")
 
 	ledger := artifacts.ReadPIILedger(dir)
 	require.NotNil(t, ledger)
 	assert.Equal(t, 0, ledger.FindingsCountBefore)
+}
+
+func TestPIIAuditCmd_AccountIdentifiersInReproTree(t *testing.T) {
+	dir := t.TempDir()
+	body := `{
+  "accountId": "4839201756",
+  "partyId": "77120934581",
+  "digitalAccountIdentifier": "AB12CD34EF56GH78",
+  "account": {"number": "000123456789"},
+  "email": "jane.doe@gmail.com"
+}
+`
+	writeFile(t, filepath.Join(dir, "sample.json"), body)
+	writeFile(t, filepath.Join(dir, ".manuscripts", "run1", "research", "notes.json"), body)
+
+	cmd := newPIIAuditCmd()
+	stdout := &bytes.Buffer{}
+	cmd.SetOut(stdout)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{dir, "--json"})
+	require.NoError(t, cmd.Execute())
+
+	var findings []artifacts.PIIFinding
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &findings))
+
+	want := []string{"4839201756", "77120934581", "AB12CD34EF56GH78", "000123456789"}
+	for _, file := range []string{"sample.json", ".manuscripts/run1/research/notes.json"} {
+		var accounts, emails []string
+		for _, f := range findings {
+			if f.File != file {
+				continue
+			}
+			switch f.Kind {
+			case artifacts.PIIKindAccountID:
+				accounts = append(accounts, f.MatchedSpan)
+			case artifacts.PIIKindEmail:
+				emails = append(emails, f.MatchedSpan)
+			}
+		}
+		assert.ElementsMatch(t, want, accounts, file)
+		assert.Equal(t, []string{"jane.doe@gmail.com"}, emails, file)
+	}
 }
 
 func TestPIIAuditCmd_TypedExitCodesAnnotation(t *testing.T) {

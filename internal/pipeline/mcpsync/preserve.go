@@ -1,0 +1,625 @@
+package mcpsync
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+// mcpRuntimeSnapshot holds pre-sync copies of MCP files that may carry
+// hand-authored behavior. Description overrides still flow through
+// GenerateMCPSurface into tools.go; these snapshots are restored or
+// merged afterward so a description refresh cannot delete poll loops,
+// annotation rules, destination-flag blocklists, or HTTP timeouts.
+// httpAuthTests is keyed by the entrypoint path and restored only when
+// that entrypoint cannot compile the regenerated HTTP auth tests.
+type mcpRuntimeSnapshot struct {
+	files         map[string][]byte
+	httpAuthTests map[string][]byte
+}
+
+var (
+	handAuthoredDBFlag     = regexp.MustCompile(`"db"\s*:\s*true`)
+	handAuthoredIntentMark = regexp.MustCompile(`\b(waitForIntentPoll|intentDuration|pollAfter|operationTimeout)\b`)
+)
+
+func snapshotMCPRuntime(cliDir string) (*mcpRuntimeSnapshot, error) {
+	snap := &mcpRuntimeSnapshot{files: map[string][]byte{}}
+	if err := snapshotDirGoFiles(cliDir, snap, filepath.Join("internal", "mcp", "cobratree")); err != nil {
+		return nil, err
+	}
+	if err := snapshotExistingFile(cliDir, snap, filepath.Join("internal", "mcp", "intents.go")); err != nil {
+		return nil, err
+	}
+	matches, err := filepath.Glob(filepath.Join(cliDir, "cmd", "*-pp-mcp", "main.go"))
+	if err != nil {
+		return nil, fmt.Errorf("listing MCP entrypoints: %w", err)
+	}
+	for _, abs := range matches {
+		rel, err := filepath.Rel(cliDir, abs)
+		if err != nil {
+			return nil, err
+		}
+		if err := snapshotExistingFile(cliDir, snap, rel); err != nil {
+			return nil, err
+		}
+		if err := snapshotMCPHTTPAuthTest(cliDir, snap, rel); err != nil {
+			return nil, err
+		}
+	}
+	return snap, nil
+}
+
+func snapshotMCPHTTPAuthTest(cliDir string, snap *mcpRuntimeSnapshot, mainRel string) error {
+	testRel := filepath.Join(filepath.Dir(mainRel), "http_auth_test.go")
+	data, err := os.ReadFile(filepath.Join(cliDir, testRel))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading %s: %w", testRel, err)
+	}
+	if snap.httpAuthTests == nil {
+		snap.httpAuthTests = map[string][]byte{}
+	}
+	snap.httpAuthTests[filepath.ToSlash(mainRel)] = data
+	return nil
+}
+
+func snapshotDirGoFiles(cliDir string, snap *mcpRuntimeSnapshot, relDir string) error {
+	entries, err := os.ReadDir(filepath.Join(cliDir, relDir))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading %s: %w", relDir, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			continue
+		}
+		if err := snapshotExistingFile(cliDir, snap, filepath.Join(relDir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func snapshotExistingFile(cliDir string, snap *mcpRuntimeSnapshot, rel string) error {
+	data, err := os.ReadFile(filepath.Join(cliDir, rel))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading %s: %w", rel, err)
+	}
+	snap.files[filepath.ToSlash(rel)] = data
+	return nil
+}
+
+func restoreMCPRuntime(cliDir string, snap *mcpRuntimeSnapshot) error {
+	if snap == nil {
+		return nil
+	}
+	for rel, before := range snap.files {
+		abs := filepath.Join(cliDir, filepath.FromSlash(rel))
+		if isMCPIntentFile(rel) {
+			after, err := os.ReadFile(abs)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					if err := writeFileAtomic(abs, before); err != nil {
+						return err
+					}
+					continue
+				}
+				return fmt.Errorf("reading regenerated %s: %w", rel, err)
+			}
+			merged, err := mergeHandAuthoredIntentFile(before, after)
+			if err != nil {
+				return fmt.Errorf("merging hand-authored intents in %s: %w", rel, err)
+			}
+			if err := writeFileAtomic(abs, merged); err != nil {
+				return err
+			}
+			continue
+		}
+		if !hasHandAuthoredMCPBehavior(before) {
+			continue
+		}
+		if err := writeFileAtomic(abs, before); err != nil {
+			return err
+		}
+		if err := preserveHTTPAuthTests(cliDir, snap, rel, before); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isMCPEntrypointMain(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	return strings.HasPrefix(rel, "cmd/") && strings.Contains(rel, "-pp-mcp/") && strings.HasSuffix(rel, "/main.go")
+}
+
+// preserveHTTPAuthTests puts the pre-sync HTTP tests back when the restored
+// entrypoint lacks the origin helpers the regenerated tests call. An
+// entrypoint that already defines those helpers keeps the regenerated tests.
+func preserveHTTPAuthTests(cliDir string, snap *mcpRuntimeSnapshot, mainRel string, mainSrc []byte) error {
+	if snap == nil || !isMCPEntrypointMain(mainRel) || mcpEntrypointSupportsHTTPAuthTests(mainSrc) {
+		return nil
+	}
+	testRel := filepath.ToSlash(filepath.Join(filepath.Dir(filepath.FromSlash(mainRel)), "http_auth_test.go"))
+	abs := filepath.Join(cliDir, filepath.FromSlash(testRel))
+	if before, ok := snap.httpAuthTests[filepath.ToSlash(mainRel)]; ok {
+		return writeFileAtomic(abs, before)
+	}
+	if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing %s: %w", testRel, err)
+	}
+	return nil
+}
+
+// mcpEntrypointSupportsHTTPAuthTests reports whether mainSrc defines the
+// helpers the regenerated HTTP auth tests call. Parameter counts match
+// the declarations, not a particular formatting of the call.
+func mcpEntrypointSupportsHTTPAuthTests(mainSrc []byte) bool {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", mainSrc, 0)
+	if err != nil {
+		return false
+	}
+	var origins, limits bool
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv != nil || fn.Type == nil {
+			continue
+		}
+		switch fn.Name.Name {
+		case "requireBearerAuthWithOrigins":
+			origins = funcParamCount(fn.Type.Params) == 3
+		case "requireBearerAuthWithLimits":
+			limits = funcParamCount(fn.Type.Params) == 5
+		}
+	}
+	return origins && limits
+}
+
+func funcParamCount(list *ast.FieldList) int {
+	if list == nil {
+		return 0
+	}
+	n := 0
+	for _, field := range list.List {
+		if len(field.Names) == 0 {
+			n++
+			continue
+		}
+		n += len(field.Names)
+	}
+	return n
+}
+
+func isMCPIntentFile(rel string) bool {
+	return filepath.ToSlash(rel) == "internal/mcp/intents.go"
+}
+
+func hasHandAuthoredMCPBehavior(src []byte) bool {
+	if handAuthoredIntentMark.Match(src) {
+		return true
+	}
+	if bytes.Contains(src, []byte("func isMCPExecutionReadOnly(")) {
+		return true
+	}
+	if bytes.Contains(src, []byte("localWrite := isMCPLocalWrite")) {
+		return true
+	}
+	// Generated HTTP servers set ReadHeaderTimeout and IdleTimeout to fixed
+	// literals and leave server-wide read/write deadlines unset. A different
+	// field value, or any read/write deadline field, is hand-authored.
+	// Missing IdleTimeout is not: older prints should receive the new value.
+	code := mcpCodeWithoutComments(src)
+	if readTimeoutField.Match(code) || writeTimeoutField.Match(code) || timeoutAssignment.Match(code) {
+		return true
+	}
+	if hasNonGeneratedTimeoutValue(code, readHeaderTimeoutField, generatedMCPReadHeaderTimeoutValue) {
+		return true
+	}
+	if hasNonGeneratedTimeoutValue(code, idleTimeoutField, generatedMCPIdleTimeoutValue) {
+		return true
+	}
+	// The db marker is itself a string literal. Timeout scanning drops string
+	// contents; the db scan has to keep them or the generated map entry and a
+	// hand-added one both disappear.
+	return hasHandAuthoredDBFlag(mcpCodeKeepingStrings(src))
+}
+
+const (
+	generatedMCPReadHeaderTimeoutValue = "10 * time.Second"
+	generatedMCPIdleTimeoutValue       = "2 * time.Minute"
+)
+
+var (
+	readHeaderTimeoutField = regexp.MustCompile(`\bReadHeaderTimeout\s*:\s*([^,\n}]+)`)
+	idleTimeoutField       = regexp.MustCompile(`\bIdleTimeout\s*:\s*([^,\n}]+)`)
+	readTimeoutField       = regexp.MustCompile(`\bReadTimeout\s*:`)
+	writeTimeoutField      = regexp.MustCompile(`\bWriteTimeout\s*:`)
+	// Generated servers set timeouts in the struct literal. An assignment
+	// (httpSrv.ReadTimeout = ...) is a hand edit the field-colon check misses.
+	timeoutAssignment = regexp.MustCompile(`\b(?:ReadTimeout|WriteTimeout|IdleTimeout|ReadHeaderTimeout)\s*=`)
+)
+
+func hasNonGeneratedTimeoutValue(code []byte, field *regexp.Regexp, generated string) bool {
+	for _, match := range field.FindAllSubmatch(code, -1) {
+		if strings.TrimSpace(string(match[1])) != generated {
+			return true
+		}
+	}
+	return false
+}
+
+// The generated blockedDestinationFlags map contains one "db" entry. A db
+// entry outside that map is a hand-extended blocklist and must survive reprint.
+func hasHandAuthoredDBFlag(code []byte) bool {
+	for _, match := range handAuthoredDBFlag.FindAllIndex(code, -1) {
+		if !generatedDestinationDB(code, match[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+func generatedDestinationDB(code []byte, idx int) bool {
+	mapIdx := bytes.LastIndex(code[:idx], []byte("var blockedDestinationFlags"))
+	if mapIdx < 0 {
+		return false
+	}
+	between := code[mapIdx:idx]
+	if bytes.Contains(between, []byte("\nvar ")) || bytes.Contains(between, []byte("\nfunc ")) || bytes.Contains(between, []byte("\nconst ")) {
+		return false
+	}
+	return true
+}
+
+// mcpCodeWithoutComments drops comments and string contents so a note that
+// quotes the generated timeout cannot hide a different field value.
+func mcpCodeWithoutComments(src []byte) []byte {
+	return stripMCPComments(src, true)
+}
+
+// mcpCodeKeepingStrings drops comments and leaves string literals intact.
+func mcpCodeKeepingStrings(src []byte) []byte {
+	return stripMCPComments(src, false)
+}
+
+func stripMCPComments(src []byte, dropStrings bool) []byte {
+	var b bytes.Buffer
+	b.Grow(len(src))
+	i := 0
+	for i < len(src) {
+		if src[i] == '"' || src[i] == '\'' || src[i] == '`' {
+			quote := src[i]
+			b.WriteByte(quote)
+			i++
+			if quote == '`' {
+				for i < len(src) && src[i] != '`' {
+					if !dropStrings {
+						b.WriteByte(src[i])
+					}
+					i++
+				}
+			} else {
+				for i < len(src) {
+					if src[i] == '\\' && i+1 < len(src) {
+						if !dropStrings {
+							b.WriteByte(src[i])
+							b.WriteByte(src[i+1])
+						}
+						i += 2
+						continue
+					}
+					if src[i] == quote || src[i] == '\n' {
+						break
+					}
+					if !dropStrings {
+						b.WriteByte(src[i])
+					}
+					i++
+				}
+			}
+			if i < len(src) && src[i] == quote {
+				b.WriteByte(quote)
+				i++
+			}
+			continue
+		}
+		if i+1 < len(src) && src[i] == '/' && src[i+1] == '/' {
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if i+1 < len(src) && src[i] == '/' && src[i+1] == '*' {
+			i += 2
+			for i+1 < len(src) && (src[i] != '*' || src[i+1] != '/') {
+				i++
+			}
+			if i+1 < len(src) {
+				i += 2
+			} else {
+				i = len(src)
+			}
+			continue
+		}
+		b.WriteByte(src[i])
+		i++
+	}
+	return b.Bytes()
+}
+
+func mergeHandAuthoredIntentFile(before, after []byte) ([]byte, error) {
+	if !hasHandAuthoredMCPBehavior(before) {
+		return after, nil
+	}
+	fsetBefore := token.NewFileSet()
+	fileBefore, err := parser.ParseFile(fsetBefore, "intents.go", before, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing pre-sync intents.go: %w", err)
+	}
+	fsetAfter := token.NewFileSet()
+	fileAfter, err := parser.ParseFile(fsetAfter, "intents.go", after, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing regenerated intents.go: %w", err)
+	}
+
+	afterNames := map[string]bool{}
+	for _, decl := range fileAfter.Decls {
+		for _, name := range collectDeclNames(decl) {
+			afterNames[name] = true
+		}
+	}
+
+	beforeByName := map[string]intentDecl{}
+	for _, decl := range fileBefore.Decls {
+		if isImportDecl(decl) {
+			continue
+		}
+		item := intentDecl{decl: decl, src: nodeSource(fsetBefore, before, decl)}
+		for _, name := range collectDeclNames(decl) {
+			beforeByName[name] = item
+		}
+	}
+
+	keep := map[string]bool{}
+	for _, decl := range fileBefore.Decls {
+		if isImportDecl(decl) {
+			continue
+		}
+		src := nodeSource(fsetBefore, before, decl)
+		if !declHasIntentMarkers(src) {
+			continue
+		}
+		if isGeneratedIntentHandler(decl) {
+			for _, name := range collectDeclNames(decl) {
+				if afterNames[name] {
+					keep[name] = true
+				}
+			}
+			continue
+		}
+		for _, name := range collectDeclNames(decl) {
+			keep[name] = true
+		}
+	}
+	expandPreservedIntentDeps(keep, beforeByName, afterNames)
+
+	merged := string(after)
+	appended := map[string]bool{}
+	for _, name := range sortedKeepNames(keep) {
+		item, ok := beforeByName[name]
+		if !ok {
+			continue
+		}
+		if afterNames[name] {
+			if !declHasIntentMarkers(item.src) {
+				continue
+			}
+			afterSrc, found := declSourceByName(fsetAfter, after, fileAfter, name)
+			if found && afterSrc != item.src {
+				merged = strings.Replace(merged, afterSrc, item.src, 1)
+			}
+			continue
+		}
+		if appended[item.src] {
+			continue
+		}
+		merged = strings.TrimRight(merged, "\n") + "\n\n" + item.src + "\n"
+		appended[item.src] = true
+	}
+
+	for _, path := range importPaths(fileBefore) {
+		merged = ensureImport(merged, path)
+	}
+	formatted, err := format.Source([]byte(merged))
+	if err != nil {
+		return nil, fmt.Errorf("formatting merged intents.go: %w", err)
+	}
+	return formatted, nil
+}
+
+func isImportDecl(decl ast.Decl) bool {
+	gen, ok := decl.(*ast.GenDecl)
+	return ok && gen.Tok == token.IMPORT
+}
+
+func collectDeclNames(decl ast.Decl) []string {
+	switch d := decl.(type) {
+	case *ast.FuncDecl:
+		return []string{d.Name.Name}
+	case *ast.GenDecl:
+		var names []string
+		for _, spec := range d.Specs {
+			switch s := spec.(type) {
+			case *ast.TypeSpec:
+				names = append(names, s.Name.Name)
+			case *ast.ValueSpec:
+				for _, name := range s.Names {
+					names = append(names, name.Name)
+				}
+			}
+		}
+		return names
+	}
+	return nil
+}
+
+type intentDecl struct {
+	decl ast.Decl
+	src  string
+}
+
+func isGeneratedIntentHandler(decl ast.Decl) bool {
+	fn, ok := decl.(*ast.FuncDecl)
+	if !ok || fn.Type == nil || !strings.HasPrefix(fn.Name.Name, "handle") {
+		return false
+	}
+	return hasNamedType(fn.Type.Params, "CallToolRequest") && hasNamedType(fn.Type.Results, "CallToolResult")
+}
+
+func hasNamedType(fields *ast.FieldList, name string) bool {
+	if fields == nil {
+		return false
+	}
+	for _, field := range fields.List {
+		if typeIdentName(field.Type) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func typeIdentName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	case *ast.StarExpr:
+		return typeIdentName(t.X)
+	default:
+		return ""
+	}
+}
+
+func expandPreservedIntentDeps(keep map[string]bool, beforeByName map[string]intentDecl, afterNames map[string]bool) {
+	changed := true
+	for changed {
+		changed = false
+		for name := range keep {
+			item, ok := beforeByName[name]
+			if !ok {
+				continue
+			}
+			for _, ident := range packageIdentNames(item.decl) {
+				dep, ok := beforeByName[ident]
+				if !ok {
+					continue
+				}
+				if isGeneratedIntentHandler(dep.decl) && !afterNames[ident] {
+					continue
+				}
+				if !keep[ident] {
+					keep[ident] = true
+					changed = true
+				}
+			}
+		}
+	}
+}
+
+func packageIdentNames(decl ast.Decl) []string {
+	seen := map[string]bool{}
+	var names []string
+	ast.Inspect(decl, func(node ast.Node) bool {
+		ident, ok := node.(*ast.Ident)
+		if !ok || ident.Name == "" || seen[ident.Name] {
+			return true
+		}
+		seen[ident.Name] = true
+		names = append(names, ident.Name)
+		return true
+	})
+	return names
+}
+
+func sortedKeepNames(keep map[string]bool) []string {
+	names := make([]string, 0, len(keep))
+	for name := range keep {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+func declSourceByName(fset *token.FileSet, src []byte, file *ast.File, name string) (string, bool) {
+	for _, decl := range file.Decls {
+		if slices.Contains(collectDeclNames(decl), name) {
+			return nodeSource(fset, src, decl), true
+		}
+	}
+	return "", false
+}
+
+func nodeSource(fset *token.FileSet, src []byte, node ast.Node) string {
+	start := fset.Position(node.Pos()).Offset
+	end := fset.Position(node.End()).Offset
+	if start < 0 || end > len(src) || start >= end {
+		return ""
+	}
+	return string(src[start:end])
+}
+
+func declHasIntentMarkers(src string) bool {
+	return handAuthoredIntentMark.MatchString(src)
+}
+
+func importPaths(file *ast.File) []string {
+	var paths []string
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func ensureImport(src, path string) string {
+	quoted := strconv.Quote(path)
+	if strings.Contains(src, quoted) {
+		return src
+	}
+	block := regexp.MustCompile(`import \(\n`)
+	if loc := block.FindStringIndex(src); loc != nil {
+		return src[:loc[1]] + "\t" + quoted + "\n" + src[loc[1]:]
+	}
+	single := regexp.MustCompile(`(?m)^import .+\n`)
+	if loc := single.FindStringIndex(src); loc != nil {
+		return src[:loc[1]] + "import " + quoted + "\n" + src[loc[1]:]
+	}
+	pkg := regexp.MustCompile(`(?m)^package \w+\n`)
+	if loc := pkg.FindStringIndex(src); loc != nil {
+		return src[:loc[1]] + "\nimport " + quoted + "\n" + src[loc[1]:]
+	}
+	return src
+}

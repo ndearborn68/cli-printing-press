@@ -8,7 +8,7 @@ The Printing Press has a fast path and a managed path.
 
 The fast path is the `/printing-press` skill. It runs the flow end to end in one session, produces a CLI plus an MCP server, and reports back. The high-level step list lives in `README.md` under "How It Works."
 
-The managed path is the 9-phase pipeline. It breaks the same work into phases the user can stop at, resume, re-run, and inspect. Each phase has its own plan file, its own artifacts directory, and its own gate. This is what `printing-press pipeline` creates. It is also how this contract should be read: the fast path compresses these phases, it does not replace them.
+The managed path is the 9-phase pipeline. It breaks the same work into phases the user can stop at, resume, re-run, and inspect. Each phase has its own plan file, its own artifacts directory, and its own gate. This is what `printing-press print` creates. It is also how this contract should be read: the fast path compresses these phases, it does not replace them.
 
 Both paths converge on the same quality bar. A CLI produced by the fast path should score the same as one produced by the managed path.
 
@@ -28,6 +28,23 @@ Every managed run gets three sibling directories under the run root:
 
 The working CLI tree lives separately under the API's output directory until `ship` promotes it.
 
+`pipeline/state.json` records run identity (`api_name`, `run_id`, working-directory pointers) and optional operator inputs that later phases cannot recover from the archived spec. `category` is the public-library slug from `generate --category`. Ship/promote copies it into `.printing-press.json`. A missing category still promotes, with a warning. The research-directory `state.json` may carry the same `category` so generate can persist it before a runstate working dir exists.
+
+### Which run `lock promote` uses
+
+In-place `lock promote --dir <working-dir>` loads the run that supplies promotion proofs with `FindStateByWorkingDir` (`internal/pipeline/state.go`). The path is made absolute. Candidates are readable `state.json` files under `.runstate/<scope>/runs/` in the current scope and in every scope, limited to runs whose effective working directory equals that path (`working_dir`, otherwise `output_dir`). Unreadable or unparsable state files are ignored. An empty `run_id` or `scope` is filled from the state file's path.
+
+When several runs share the directory:
+
+1. A current-run pointer in the current scope (`current/<api>.json`) whose `state_path` is one of those candidates wins. Pointers that do not parse, have an empty `state_path`, or name a run for another directory are ignored. Pointers stored under a different scope are not consulted. If several current-scope pointers match, the latest `updated_at` wins; equal timestamps use the recency order below.
+2. Otherwise the newest candidate wins: later `started_at`, then later `state.json` modification time, then the lexicographically greater `run_id`, then the lexicographically greater state path. A zero `started_at` loses to any timestamp.
+
+That run's id is the one promote checks. Phase 5 markers are read, in order, from `<working-dir>/.manuscripts/<run_id>/proofs`, the published manuscripts tree for the API name, the published manuscripts tree for the CLI name, and that run's runstate `proofs/` directory. Missing directories are skipped, and a failing marker does not block a later candidate; the first passing marker satisfies the gate. The same run's runstate `proofs/`, `research/`, and `discovery/` are copied into the promoted tree's `.manuscripts/<run_id>/` where the working tree does not already have them.
+
+If no candidate matches, promote uses a minimal state. A run for the CLI's API name is borrowed when one can be loaded: the current scope's pointer for that name when its state file exists, otherwise the current-scope run for that name with the latest `state.json` modification time (runs excluded from current resolution are skipped), otherwise a legacy state file. The borrowed run's id and scope select the proofs; the caller's directory stays the copy source. With no recoverable run id, the Phase 5 gate and the manuscript copy are skipped.
+
+The source fingerprint on the Phase 5 marker hashes Go sources, `go.mod`, `go.sum`, and spec files in the working tree (`internal/pipeline/source_fingerprint.go`). The tree root stays in the fingerprint when it is itself a module or a git checkout. A nested directory is omitted when it is a separate tree: a regular `go.mod` file, or a `.git` checkout (a `gitdir:` file, or a `.git` directory whose `HEAD` is a regular file containing a ref or a 40- or 64-character commit id). Directories named `.git`, `.manuscripts`, and `.printing-press` are always omitted. A symlink `.git`, or a `go.mod` that is not a regular file, does not mark a separate tree.
+
 ## Phase status model
 
 Every phase has two orthogonal status fields:
@@ -38,6 +55,8 @@ Every phase has two orthogonal status fields:
 | `PlanStatus` | seed, expanded, completed |
 
 `Status` tracks the execution state of the phase. `PlanStatus` tracks the state of the phase's plan file: a freshly-initialized phase has a `seed` plan; once expanded by the planner it becomes `expanded`; once the phase finishes it becomes `completed`. Both are defined in `internal/pipeline/state.go`.
+
+`LoadState` and `save()` defensively initialize the on-disk `phases` map to an empty object when it is unmarshaled as nil. Phase names, ordering, transitions, and the version-migration semantics described in this document are unaffected by that guard.
 
 ## Phases
 
@@ -72,7 +91,6 @@ Purpose: discover and score the existing CLI landscape for the target API before
 
 Inputs:
 - Validated spec URL from preflight
-- `catalog/<api>.yaml` if the API is catalog-known (for `known_alternatives`)
 
 Outputs:
 - `research.json` in the pipeline directory with:
@@ -108,7 +126,7 @@ Freshness ownership:
 - Freshness metadata belongs in the existing JSON provenance envelope at `meta.freshness`. It describes current-cache freshness for the covered path only; it must not be described as full historical backfill or API-specific enrichment.
 
 Gates:
-- All eight generator quality gates pass: `go mod tidy`, default-mode `govulncheck`, `go vet`, `go build`, binary build, `--help`, version, `doctor`
+- All ten generator quality gates pass: `go mod tidy`, safe `golang.org/x/net`, fresh generated `go test -count=1 ./...`, default-mode `govulncheck`, `go vet`, `go build`, binary build, `--help`, version, `doctor`
 
 Artifacts:
 - Full CLI source tree in the output directory
@@ -147,7 +165,7 @@ Outputs:
 
 Gates:
 - Overlay merge completes without conflicts
-- All eight generator quality gates pass again after regeneration, including default-mode `govulncheck`
+- All ten generator quality gates pass again after regeneration, including safe `golang.org/x/net`, fresh generated `go test -count=1 ./...`, and default-mode `govulncheck`
 
 Artifacts:
 - Merged spec (format follows the source spec)
@@ -190,6 +208,7 @@ Outputs:
 - Reviewer scorecard across seven principles and three severities
 - Fix implementation log (which fixes were applied, which were skipped or reverted)
 - Phase verdict: `Pass`, `Warn`, or `Degrade`
+- `pipeline/agent-readiness.md` with a parseable `Phase verdict: Pass|Warn|Degrade` line and remaining Blocker/Friction findings as bullets or table rows
 
 Gates:
 - `Pass` - zero Blockers and zero Frictions
@@ -197,7 +216,7 @@ Gates:
 - `Degrade` - Blockers remain; phase fails
 
 Artifacts:
-- Reviewer scorecard document in the pipeline directory
+- `pipeline/agent-readiness.md`
 - Fix log in the pipeline directory
 
 ### 8. comparative
@@ -239,6 +258,7 @@ Purpose: package the generated CLI output and produce the final handoff report.
 
 Inputs:
 - Review score and `review.md` from the review phase
+- Agent-readiness verdict from `agent-readiness.md`
 - Working CLI binary ready for handoff
 
 Outputs:
@@ -248,6 +268,7 @@ Outputs:
 
 Gates:
 - All prior phases are `completed`
+- `agent-readiness.md` reports `Pass`, unless a maintainer records an explicit override in the handoff
 - Output directory contains a valid CLI source tree and compiled binary
 
 Artifacts:
@@ -260,7 +281,7 @@ Artifacts:
 Two other Printing Press entrypoints run flows that share structure with the managed pipeline:
 
 - `printing-press run` drives `MakeBestCLI` in `internal/pipeline/fullrun.go`. It compresses the full flow into one call and reports a single `FullRunResult`. Its internal step list (research, generate, polish, coverage, dogfood, verification, workflow-verify, scorecard, fix plans, publish) maps to the managed phases but does not use the phase state machine.
-- The `/printing-press` skill uses its own high-level Phase 0..5 layout documented in `README.md`. That layout is a compression of the same work, not a competing contract.
+- The `/printing-press` skill executes 21 files under `skills/printing-press/phases/` keyed by filename stems (`10-generate`, not "Phase 2"). Receipts start at `02-run-initialization`. The Phase 0..5 diagram in `README.md` is a compression map of that workflow, not the receipt IDs.
 
 Both flows should produce artifacts that match the shape described here for the phases they cover.
 
@@ -270,4 +291,4 @@ The `review` phase is where the shipcheck block runs - dogfood, verify, and scor
 
 ## Keeping this document in sync
 
-Phase names, ordering, and numbering are authoritative in `internal/pipeline/state.go`. Per-phase intent, inputs, outputs, and pointers are authoritative in `internal/pipeline/seeds.go`. When those files change, update this document in the same PR. A future follow-up may generate this document from those sources automatically.
+Phase names, ordering, and numbering are authoritative in `internal/pipeline/state.go`. Per-phase intent, inputs, outputs, and pointers are authoritative in `internal/pipeline/seeds.go`. Working-directory run selection for `lock promote` is `FindStateByWorkingDir` in the same file. The source-fingerprint walk those proofs compare against is `CaptureSourceFingerprint` in `internal/pipeline/source_fingerprint.go`. When those files change, update this document in the same PR. A future follow-up may generate this document from those sources automatically.

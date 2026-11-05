@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/naming"
@@ -20,14 +23,20 @@ const (
 	mcpbServerTypeBinary = "binary"
 	mcpbVarTypeString    = "string"
 
-	authTypeAPIKey      = "api_key"
-	authTypeBearerToken = "bearer_token"
-	authTypeOAuth2      = "oauth2"
+	authTypeAPIKey        = "api_key"
+	authTypeBearerToken   = "bearer_token"
+	authTypeOAuth2        = "oauth2"
+	authTypeOAuth2Refresh = "oauth2_refresh"
+
+	mcpbClientProfileEnvName = "PRINTING_PRESS_CLIENT_PROFILE"
+	mcpbClientProfileUserKey = "printing_press_client_profile"
 )
 
 // defaultMCPBPlatforms is the set of host platforms our generated bundles
 // target. Matches goreleaser's default Go cross-compile matrix.
 var defaultMCPBPlatforms = []string{"darwin", "linux", "win32"}
+
+var semverVersionRE = regexp.MustCompile(`^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
 
 // minClaudeDesktopVersion is the minimum Claude Desktop release that
 // understands the MCPB bundle format we emit. 1.0.0 is the version that
@@ -49,7 +58,7 @@ const MCPBManifestVersion = "0.3"
 // root of an MCPB bundle ZIP. Field names and JSON tags match the upstream
 // schema at https://github.com/modelcontextprotocol/mcpb/blob/main/MANIFEST.md.
 // We do not exhaustively model every optional field — only what the
-// generator can fill from existing spec/catalog metadata. Authors who need
+// generator can fill from existing spec or manifest metadata. Authors who need
 // niche fields (icons, screenshots, prompts, localization) can hand-edit
 // the emitted manifest.json before bundling, which lives next to the CLI
 // source like .printing-press.json does.
@@ -123,25 +132,157 @@ type MCPBCompat struct {
 	Platforms     []string `json:"platforms,omitempty"`
 }
 
-// WriteMCPBManifest emits manifest.json for a published CLI directory by
-// reading .printing-press.json. Skips silently only when the CLI dir has
-// no .printing-press.json or no MCP binary — every other CLI ships a
-// manifest, including composed/cookie-auth ones with a "partial" MCPReady
-// label. The user_config block conveys auth-required-or-optional via
-// authRequiresCredential, which is enough for the host to prompt or skip.
+// WriteMCPBManifest emits manifest.json for a CLI directory by reading
+// .printing-press.json. When mcp_binary is empty and cmd contains exactly
+// one *-pp-mcp directory, that directory name is used. An internal/mcp tree
+// with no cmd/*-pp-mcp entry point is an error: the bundle manifest must
+// not name a binary the tree cannot build. A missing CLI manifest returns
+// nil so mcp-sync can refresh MCP packages before provenance exists; package
+// and promote call EnsureMCPBManifest, which fails in that case. Any other
+// read or write failure is returned.
 //
 // Callers that already have the CLIManifest in memory should use
 // WriteMCPBManifestFromStruct to avoid the re-read.
 func WriteMCPBManifest(dir string) error {
 	data, err := os.ReadFile(filepath.Join(dir, CLIManifestFilename))
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			// mcp-sync refreshes partial trees before a CLI manifest exists.
+			// Package and promote use EnsureMCPBManifest, which still fails
+			// when that surface cannot produce manifest.json.
+			return nil
+		}
+		return fmt.Errorf("reading %s for MCPB: %w", CLIManifestFilename, err)
 	}
 	var m CLIManifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return fmt.Errorf("parsing manifest for MCPB: %w", err)
 	}
-	return WriteMCPBManifestFromStruct(dir, m)
+	if strings.TrimSpace(m.MCPBinary) == "" {
+		surface, err := mcpSurfacePresent(dir)
+		if err != nil {
+			return err
+		}
+		if !surface {
+			return nil
+		}
+		name, err := inferMCPBinaryName(dir, m)
+		if err != nil {
+			return err
+		}
+		m.MCPBinary = name
+	}
+	if err := WriteMCPBManifestFromStruct(dir, m); err != nil {
+		return err
+	}
+	return requireMCPBManifestFile(dir)
+}
+
+// EnsureMCPBManifest writes manifest.json and fails when an MCP surface is
+// present but the bundle manifest was not produced. WriteMCPBManifest still
+// returns nil when .printing-press.json is absent so in-progress syncs can
+// refresh the MCP packages before provenance exists.
+func EnsureMCPBManifest(dir string) error {
+	if err := WriteMCPBManifest(dir); err != nil {
+		return err
+	}
+	surface, err := mcpSurfacePresent(dir)
+	if err != nil {
+		return err
+	}
+	if !surface {
+		return nil
+	}
+	info, err := os.Stat(filepath.Join(dir, MCPBManifestFilename))
+	if err == nil && info.Mode().IsRegular() {
+		return nil
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, CLIManifestFilename)); os.IsNotExist(statErr) {
+		return fmt.Errorf("MCP surface present but %s is missing", CLIManifestFilename)
+	}
+	return fmt.Errorf("MCP surface present but %s was not written", MCPBManifestFilename)
+}
+
+func requireMCPBManifestFile(dir string) error {
+	surface, err := mcpSurfacePresent(dir)
+	if err != nil {
+		return err
+	}
+	if !surface {
+		return nil
+	}
+	info, err := os.Stat(filepath.Join(dir, MCPBManifestFilename))
+	if err != nil || !info.Mode().IsRegular() {
+		return fmt.Errorf("MCP surface present but %s was not written", MCPBManifestFilename)
+	}
+	return nil
+}
+
+func mcpSurfacePresent(dir string) (bool, error) {
+	names, err := mcpCommandNames(dir)
+	if err != nil {
+		return false, err
+	}
+	if len(names) > 0 {
+		return true, nil
+	}
+	info, err := os.Stat(filepath.Join(dir, "internal", "mcp"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return info.IsDir(), nil
+}
+
+func mcpCommandNames(dir string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(dir, "cmd"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasSuffix(entry.Name(), naming.MCPSuffix) {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func inferMCPBinaryName(dir string, m CLIManifest) (string, error) {
+	names, err := mcpCommandNames(dir)
+	if err != nil {
+		return "", err
+	}
+	switch len(names) {
+	case 1:
+		return names[0], nil
+	case 0:
+		return "", fmt.Errorf("MCP surface present but no cmd/*%s entry point", naming.MCPSuffix)
+	default:
+		want := map[string]struct{}{}
+		if api := strings.TrimSpace(m.APIName); api != "" {
+			want[naming.MCP(api)] = struct{}{}
+		}
+		if cli := strings.TrimSpace(m.CLIName); cli != "" {
+			want[naming.MCP(naming.TrimCLISuffix(cli))] = struct{}{}
+		}
+		var matched []string
+		for _, name := range names {
+			if _, ok := want[name]; ok {
+				matched = append(matched, name)
+			}
+		}
+		if len(matched) == 1 {
+			return matched[0], nil
+		}
+		return "", fmt.Errorf("ambiguous MCP command directories: %s", strings.Join(names, ", "))
+	}
 }
 
 // WriteMCPBManifestFromStruct is the in-memory variant of WriteMCPBManifest.
@@ -151,6 +292,17 @@ func WriteMCPBManifestFromStruct(dir string, m CLIManifest) error {
 	if m.MCPBinary == "" {
 		return nil
 	}
+	// Generated os.Getenv names move with the CLI env prefix; endpoint
+	// metadata can still name the pre-rename variable. Bind against the
+	// name the printed client reads so the installer and first request
+	// stay paired. Drop colliding auth-named overrides only when the
+	// printed client already reads the default name (or no longer reads
+	// the override); a manifest-only refresh must not rebind to
+	// SHOPIFY_SHOP while legacy source still Getenvs the credential.
+	generated := scanGeneratedEnvSet(dir)
+	m.generatedEnvReads = generated
+	m = dropCollidingEndpointTemplateOverrides(m, generated)
+	m = alignEndpointTemplateEnvNames(dir, m)
 	out, err := marshalMCPBManifest(buildMCPBManifest(dir, m))
 	if err != nil {
 		return err
@@ -158,12 +310,11 @@ func WriteMCPBManifestFromStruct(dir string, m CLIManifest) error {
 	if err := os.WriteFile(filepath.Join(dir, MCPBManifestFilename), out, 0o644); err != nil {
 		return err
 	}
-	// Extend the just-written manifest with env vars read by
-	// internal/client/*.go that the spec-driven build didn't surface
-	// (credential-flow JWT refreshers, hand-written auth helpers, etc.).
-	// Runs from every writer call site so the bundle path reads a
-	// reconciled manifest regardless of whether it came through lock+promote
-	// or a one-off bundle build.
+	// Extend the just-written manifest with env vars the spec-driven
+	// build didn't surface (per-instance BASE_URL, credential-flow JWT
+	// refreshers, hand-written auth helpers). Runs from every writer
+	// call site so lock+promote and one-off bundle builds read the same
+	// reconciled file.
 	return reconcileMCPBManifestFromClient(dir, m)
 }
 
@@ -195,15 +346,17 @@ func buildMCPBManifest(dir string, m CLIManifest) MCPBManifest {
 	if displayName == "" {
 		displayName = m.APIName
 	}
+	launchEnv := buildMCPBEnv(m)
+	userConfig := buildMCPBUserConfig(m)
+	launchEnv, userConfig = ensureMCPBClientProfileBinding(dir, launchEnv, userConfig)
 
 	return MCPBManifest{
 		ManifestVersion: MCPBManifestVersion,
 		Name:            m.MCPBinary,
 		DisplayName:     displayName,
-		// Bundle version tracks the printing-press release that produced
-		// it so Claude Desktop's update detection sees a fresh value on
-		// regeneration. A hardcoded "1.0.0" would defeat the host's
-		// "newer bundle available" prompt.
+		// The generated on-disk manifest does not know the printed CLI's
+		// release tag yet. Release packaging can stamp the bundle version
+		// into the ZIP without mutating this generate-time manifest.
 		Version:     bundleVersion(m),
 		Description: manifestDescription(existing, m, displayName),
 		Author:      MCPBAuthor{Name: "CLI Printing Press"},
@@ -214,10 +367,10 @@ func buildMCPBManifest(dir string, m CLIManifest) MCPBManifest {
 			MCPConfig: MCPBLaunchSpec{
 				Command: "${__dirname}/bin/" + m.MCPBinary,
 				Args:    []string{},
-				Env:     buildMCPBEnv(m),
+				Env:     launchEnv,
 			},
 		},
-		UserConfig: buildMCPBUserConfig(m),
+		UserConfig: userConfig,
 		Compatibility: &MCPBCompat{
 			ClaudeDesktop: minClaudeDesktopVersion,
 			Platforms:     defaultMCPBPlatforms,
@@ -225,32 +378,36 @@ func buildMCPBManifest(dir string, m CLIManifest) MCPBManifest {
 	}
 }
 
-// bundleVersion returns a semver-shaped version for the manifest. Prefers
-// the manifest's recorded printing-press version (so two bundles built
-// from different generator releases differ), falls back to the linker-
-// stamped version when the manifest field is empty (older runs).
+// bundleVersion returns the best known printed CLI bundle version at generate
+// time. Release packaging may still stamp the final public-library version
+// into the ZIP without mutating this generate-time manifest.
 func bundleVersion(m CLIManifest) string {
-	if m.PrintingPressVersion != "" {
-		return m.PrintingPressVersion
+	if v := strings.TrimSpace(m.APIVersion); isSemverVersion(v) {
+		return v
 	}
-	if version.Version != "" {
-		return version.Version
+	if v := strings.TrimSpace(m.PrintingPressVersion); isSemverVersion(v) {
+		return v
+	}
+	if v := strings.TrimSpace(version.Version); isSemverVersion(v) {
+		return v
 	}
 	return "0.0.0"
 }
 
-// manifestDescription returns the existing hand-edited description over
-// the canonical one from .printing-press.json. The existing snapshot's
-// description is only treated as "hand-edited" when it differs from
-// every form the generator would have emitted — current and prior — so
-// a manifest written before the displayNameForConcat trim still gets
-// recognized as derived and refreshed from canonical.
+func isSemverVersion(v string) bool {
+	return semverVersionRE.MatchString(v)
+}
+
+// manifestDescription preserves hand-edited bundle descriptions while letting
+// canonical manifest descriptions refresh known generated defaults and legacy
+// literal-ellipsis truncations.
 func manifestDescription(existing *existingMCPBManifest, m CLIManifest, displayName string) string {
 	derivedDefault := displayNameForConcat(displayName) + " API surface as MCP tools."
 	priorDerivedDefault := displayName + " API surface as MCP tools."
 	if existing != nil && existing.Description != "" &&
 		existing.Description != derivedDefault &&
-		existing.Description != priorDerivedDefault {
+		existing.Description != priorDerivedDefault &&
+		!naming.HasLiteralEllipsisSuffix(existing.Description) {
 		return existing.Description
 	}
 	if m.Description != "" {
@@ -294,6 +451,75 @@ func loadExistingMCPBManifest(dir string) *existingMCPBManifest {
 	return &existing
 }
 
+// Fresh MCPB installs have no default_client_profile. A registered
+// platform source exits at startup unless the installer collects the
+// tenant selector. That selector is not a substitute for the credentials
+// the binary reads.
+func ensureMCPBClientProfileBinding(dir string, env map[string]string, vars map[string]MCPBVar) (map[string]string, map[string]MCPBVar) {
+	if !needsMCPBClientProfileBinding(dir) {
+		return env, vars
+	}
+	if env == nil {
+		env = make(map[string]string, 1)
+	}
+	if vars == nil {
+		vars = make(map[string]MCPBVar, 1)
+	}
+	env[mcpbClientProfileEnvName] = "${user_config." + mcpbClientProfileUserKey + "}"
+	vars[mcpbClientProfileUserKey] = MCPBVar{
+		Type:        mcpbVarTypeString,
+		Title:       "Client profile",
+		Required:    true,
+		Description: "Binds the MCP server to an existing tenant-gated Printing Press client profile.",
+	}
+	return env, vars
+}
+
+func needsMCPBClientProfileBinding(dir string) bool {
+	var needed bool
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || needed {
+			return nil
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case "testdata", "vendor", ".git":
+				return filepath.SkipDir
+			default:
+				return nil
+			}
+		}
+		if !strings.HasSuffix(d.Name(), ".go") || strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		if sourceRegistersPlatformSource(string(data)) {
+			needed = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return needed
+}
+
+func sourceRegistersPlatformSource(src string) bool {
+	for {
+		i := strings.Index(src, "registerPlatformSource(")
+		if i < 0 {
+			return false
+		}
+		prefix := strings.TrimRight(src[:i], " \t")
+		if strings.HasSuffix(prefix, "func") {
+			src = src[i+len("registerPlatformSource("):]
+			continue
+		}
+		return true
+	}
+}
+
 // buildMCPBEnv maps each declared auth env var into the launch spec's env
 // block, pointing at the corresponding user_config slot. The host fills in
 // the value at runtime from what the user typed (or whatever the keychain
@@ -307,10 +533,7 @@ func buildMCPBEnv(m CLIManifest) map[string]string {
 	for _, envVar := range authEnvVarSpecs {
 		env[envVar.Name] = "${user_config." + userConfigKey(envVar.Name) + "}"
 	}
-	for _, templateVar := range m.EndpointTemplateVars {
-		name := endpointTemplateEnvVar(m.APIName, templateVar)
-		env[name] = "${user_config." + userConfigKey(name) + "}"
-	}
+	bindEndpointTemplateVars(m, env, nil)
 	return env
 }
 
@@ -319,8 +542,13 @@ func buildMCPBEnv(m CLIManifest) map[string]string {
 // auth type: composed/cookie flows mean some tools work unauthenticated, so
 // we keep the field optional and let the user skip it; api_key/bearer_token
 // mean the API needs the credential to do anything useful, so we mark
-// required. Endpoint template vars are always required because unresolved
-// placeholders make every request URL invalid.
+// required. Endpoint template vars are required only when the spec offers
+// no fallback default: path-positional placeholders (Shopify {shop},
+// ServiceTitan {tenant}) have no spec-level default and must be supplied,
+// but a server-URL variable carrying a `default:` value resolves at runtime
+// without user input, so marking it Required = true alongside a Default
+// presents Claude Desktop with a contradictory user_config (required field
+// pre-filled with a vendor-placeholder value the user is unlikely to want).
 func buildMCPBUserConfig(m CLIManifest) map[string]MCPBVar {
 	authEnvVarSpecs := mcpbUserConfigAuthEnvVars(m)
 	if len(authEnvVarSpecs) == 0 && len(m.EndpointTemplateVars) == 0 {
@@ -339,16 +567,7 @@ func buildMCPBUserConfig(m CLIManifest) map[string]MCPBVar {
 			Required:    required,
 		}
 	}
-	for _, templateVar := range m.EndpointTemplateVars {
-		name := endpointTemplateEnvVar(m.APIName, templateVar)
-		vars[userConfigKey(name)] = MCPBVar{
-			Type:        mcpbVarTypeString,
-			Title:       name,
-			Description: endpointTemplateVarDescription(templateVar, name),
-			Required:    true,
-			Default:     endpointTemplateDefault(m, templateVar),
-		}
-	}
+	bindEndpointTemplateVars(m, nil, vars)
 	return vars
 }
 
@@ -363,27 +582,241 @@ func mcpbUserConfigAuthEnvVars(m CLIManifest) []spec.AuthEnvVar {
 			envVarSpecs[i].Required = required
 		}
 	}
-	if len(envVarSpecs) == 0 {
+	if len(envVarSpecs) == 0 && len(m.AuthAdditionalHeaders) == 0 {
 		return nil
 	}
-	filtered := make([]spec.AuthEnvVar, 0, len(envVarSpecs))
+	filtered := make([]spec.AuthEnvVar, 0, len(envVarSpecs)+len(m.AuthAdditionalHeaders))
+	seen := make(map[string]struct{}, len(envVarSpecs))
 	for _, envVar := range envVarSpecs {
 		if envVar.Name == "" {
 			continue
 		}
-		switch envVar.Kind {
-		case "", spec.AuthEnvVarKindPerCall:
-			envVar.Kind = spec.AuthEnvVarKindPerCall
-			filtered = append(filtered, envVar)
-		case spec.AuthEnvVarKindAuthFlowInput, spec.AuthEnvVarKindHarvested:
+		envVar.Kind = envVar.EffectiveKind()
+		seen[envVar.Name] = struct{}{}
+		filtered = append(filtered, envVar)
+	}
+	// Sibling-scheme credentials (e.g. an apiKey header alongside an OAuth
+	// bearer) ride the same user_config + env-forwarding path so MCP hosts
+	// prompt for them at install time. Without this, composed-auth specs ship
+	// install bundles that silently 401 at first request.
+	for _, ah := range m.AuthAdditionalHeaders {
+		ev := ah.EnvVar
+		if ev.Name == "" {
 			continue
 		}
+		if _, dup := seen[ev.Name]; dup {
+			continue
+		}
+		ev.Kind = spec.AuthEnvVarKindPerCall
+		seen[ev.Name] = struct{}{}
+		filtered = append(filtered, ev)
 	}
 	return filtered
 }
 
-func endpointTemplateEnvVar(apiName, templateVar string) string {
-	return strings.ToUpper(naming.Snake(apiName) + "_" + naming.Snake(templateVar))
+func endpointTemplateEnvVar(m CLIManifest, templateVar string) string {
+	override := ""
+	if v, ok := m.EndpointTemplateEnvOverrides[templateVar]; ok {
+		override = v
+	}
+	resolved := spec.ResolveEndpointTemplateEnvName(m.APIName, templateVar, override, manifestAuthEnvNames(m))
+	// Resolve rejects a credential-named override of a different
+	// placeholder. Fresh prints drop that override and emit the default
+	// Getenv. A later manifest-only refresh must not rebind to the
+	// default while existing source still reads the colliding name.
+	if generatedReadsLegacyOverride(m.generatedEnvReads, strings.TrimSpace(override), spec.DefaultEndpointTemplateEnvName(m.APIName, templateVar)) {
+		return strings.TrimSpace(override)
+	}
+	return resolved
+}
+
+func manifestAuthEnvNames(m CLIManifest) []string {
+	names := make([]string, 0, len(m.AuthEnvVars)+len(m.AuthEnvVarSpecs))
+	for _, envVar := range mcpbUserConfigAuthEnvVars(m) {
+		if envVar.Name != "" {
+			names = append(names, envVar.Name)
+		}
+	}
+	names = append(names, m.AuthEnvVars...)
+	for _, envVar := range m.AuthEnvVarSpecs {
+		if envVar.Name != "" {
+			names = append(names, envVar.Name)
+		}
+	}
+	return names
+}
+
+func dropCollidingEndpointTemplateOverrides(m CLIManifest, generated map[string]struct{}) CLIManifest {
+	if len(m.EndpointTemplateEnvOverrides) == 0 {
+		return m
+	}
+	cleaned := cloneEndpointTemplateEnvOverrides(m.EndpointTemplateEnvOverrides)
+	changed := false
+	authNames := manifestAuthEnvNames(m)
+	for placeholder, override := range cleaned {
+		trimmed := strings.TrimSpace(override)
+		resolved := spec.ResolveEndpointTemplateEnvName(m.APIName, placeholder, override, authNames)
+		if resolved == trimmed {
+			continue
+		}
+		if generatedReadsLegacyOverride(generated, trimmed, resolved) {
+			continue
+		}
+		delete(cleaned, placeholder)
+		changed = true
+	}
+	if !changed {
+		return m
+	}
+	m.EndpointTemplateEnvOverrides = cleaned
+	return m
+}
+
+func generatedReadsLegacyOverride(generated map[string]struct{}, override, defaultName string) bool {
+	if len(generated) == 0 || override == "" {
+		return false
+	}
+	_, readsOverride := generated[override]
+	_, readsDefault := generated[defaultName]
+	return readsOverride && !readsDefault
+}
+
+func scanGeneratedEnvSet(dir string) map[string]struct{} {
+	reads, err := scanClientEnvReads(dir)
+	if err != nil || len(reads) == 0 {
+		return nil
+	}
+	generated := make(map[string]struct{}, len(reads))
+	for _, name := range reads {
+		generated[name] = struct{}{}
+	}
+	return generated
+}
+
+// Generated Getenv names move with the CLI env prefix; stored overrides
+// can still name the pre-rename variable. Only accept a rewrite when the
+// printed client actually reads the aligned name — an intentional
+// override that keeps a vendor's shorter env var must stay put.
+func alignEndpointTemplateEnvNames(dir string, m CLIManifest) CLIManifest {
+	if len(m.EndpointTemplateVars) == 0 {
+		return m
+	}
+	reads, err := scanClientEnvReads(dir)
+	if err != nil || len(reads) == 0 {
+		return m
+	}
+	generated := make(map[string]struct{}, len(reads))
+	for _, name := range reads {
+		generated[name] = struct{}{}
+	}
+	cloned := false
+	for _, templateVar := range m.EndpointTemplateVars {
+		override := ""
+		if v, ok := m.EndpointTemplateEnvOverrides[templateVar]; ok {
+			override = strings.TrimSpace(v)
+		}
+		defaultName := spec.DefaultEndpointTemplateEnvName(m.APIName, templateVar)
+		if generatedReadsLegacyOverride(generated, override, defaultName) {
+			continue
+		}
+		name := endpointTemplateEnvVar(m, templateVar)
+		if _, ok := generated[name]; ok {
+			continue
+		}
+		aligned := alignPrefixedEnvName(name, m.APIName)
+		if aligned == name {
+			continue
+		}
+		if _, ok := generated[aligned]; !ok {
+			continue
+		}
+		if !cloned {
+			m.EndpointTemplateEnvOverrides = cloneEndpointTemplateEnvOverrides(m.EndpointTemplateEnvOverrides)
+			cloned = true
+		}
+		m.EndpointTemplateEnvOverrides[templateVar] = aligned
+	}
+	return m
+}
+
+func cloneEndpointTemplateEnvOverrides(in map[string]string) map[string]string {
+	if in == nil {
+		return map[string]string{}
+	}
+	return maps.Clone(in)
+}
+
+// A stale override begins with a leading segment of the current CLI env
+// prefix (SHOPIFY_SHOP after shopify → shopify-alt). Custom names that
+// do not share that prefix (ST_TENANT_ID) are left alone.
+func alignPrefixedEnvName(name, apiName string) string {
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(apiName) == "" {
+		return name
+	}
+	newPrefix := naming.EnvPrefix(apiName)
+	if newPrefix == "" || name == newPrefix || strings.HasPrefix(name, newPrefix+"_") {
+		return name
+	}
+	parts := strings.Split(newPrefix, "_")
+	for i := len(parts) - 1; i >= 1; i-- {
+		oldPrefix := strings.Join(parts[:i], "_")
+		if name == oldPrefix {
+			return newPrefix
+		}
+		if strings.HasPrefix(name, oldPrefix+"_") {
+			return newPrefix + name[len(oldPrefix):]
+		}
+	}
+	return name
+}
+
+// Auth-named or credential-shaped env vars stay on the sensitive auth
+// user_config slot. Emitting them as unmasked endpoint fields would
+// prompt the installer for the raw secret.
+func isAuthOrCredentialEnvVar(m CLIManifest, name string) bool {
+	return spec.IsAuthOrCredentialEnvName(name, manifestAuthEnvNames(m))
+}
+
+// Path-positional placeholders such as {shop} are not credentials: the
+// platform profile selector does not fill them, and the first API call
+// fails if they are unset. Spec-defaulted placeholders stay optional so
+// MCPB hosts do not present Required+Default as a contradictory install
+// field. Credential-named *overrides* of a different placeholder are
+// rejected so the installer never collects an access token in an
+// unmasked field; a placeholder whose own default name is
+// credential-shaped is still bound, masked.
+func bindEndpointTemplateVars(m CLIManifest, env map[string]string, vars map[string]MCPBVar) {
+	for _, templateVar := range m.EndpointTemplateVars {
+		name, entry := endpointTemplateUserConfigEntry(m, templateVar)
+		if env != nil {
+			env[name] = "${user_config." + userConfigKey(name) + "}"
+		}
+		if vars != nil {
+			vars[userConfigKey(name)] = entry
+		}
+	}
+}
+
+func endpointTemplateUserConfigEntry(m CLIManifest, templateVar string) (string, MCPBVar) {
+	name := endpointTemplateEnvVar(m, templateVar)
+	defaultValue := endpointTemplateDefault(m, templateVar)
+	return name, MCPBVar{
+		Type:        mcpbVarTypeString,
+		Title:       name,
+		Description: endpointTemplateVarDescription(templateVar, name),
+		Required:    defaultValue == "",
+		Default:     defaultValue,
+		Sensitive:   isAuthOrCredentialEnvVar(m, name),
+	}
+}
+
+func endpointTemplateVarForEnv(m CLIManifest, name string) (string, bool) {
+	for _, templateVar := range m.EndpointTemplateVars {
+		if endpointTemplateEnvVar(m, templateVar) == name {
+			return templateVar, true
+		}
+	}
+	return "", false
 }
 
 // userConfigKey lowercases the env var so manifest user_config keys match
@@ -412,10 +845,13 @@ func authUserConfigText(m CLIManifest, envVar spec.AuthEnvVar, required bool, si
 		}
 		return title, description
 	}
-	return title, envVarDescription(m, envVar.Name, required)
+	return title, envVarDescription(m, envVar, required)
 }
 
 func endpointTemplateDefault(m CLIManifest, templateVar string) string {
+	if v := m.EndpointTemplateVarDefaults[templateVar]; v != "" {
+		return v
+	}
 	if strings.EqualFold(templateVar, "api_version") {
 		return m.APIVersion
 	}
@@ -425,21 +861,32 @@ func endpointTemplateDefault(m CLIManifest, templateVar string) string {
 // envVarDescription is the help text under each user_config field. The
 // registration URL (when we have one) is what makes the difference between
 // "fill this in" and "I don't know where to get this value."
-func envVarDescription(m CLIManifest, envVar string, required bool) string {
+func envVarDescription(m CLIManifest, envVar spec.AuthEnvVar, required bool) string {
 	var b strings.Builder
 	if !required {
 		b.WriteString("Optional. ")
 	}
-	b.WriteString("Sets ")
-	b.WriteString(envVar)
-	b.WriteString(" for the ")
+	switch envVar.EffectiveKind() {
+	case spec.AuthEnvVarKindAuthFlowInput:
+		b.WriteString("Collects ")
+		b.WriteString(envVar.Name)
+		b.WriteString(" for the auth setup flow used by the ")
+	case spec.AuthEnvVarKindHarvested:
+		b.WriteString("Stores ")
+		b.WriteString(envVar.Name)
+		b.WriteString(" after it is harvested by the auth setup flow for the ")
+	default:
+		b.WriteString("Sets ")
+		b.WriteString(envVar.Name)
+		b.WriteString(" for the ")
+	}
 	if m.DisplayName != "" {
 		b.WriteString(displayNameForConcat(m.DisplayName))
 	} else {
 		b.WriteString(m.APIName)
 	}
 	b.WriteString(" MCP server.")
-	if m.AuthKeyURL != "" {
+	if m.AuthKeyURL != "" && envVar.EffectiveKind() != spec.AuthEnvVarKindHarvested {
 		b.WriteString(" Get a credential from ")
 		b.WriteString(m.AuthKeyURL)
 		b.WriteString(".")
@@ -448,12 +895,12 @@ func envVarDescription(m CLIManifest, envVar string, required bool) string {
 }
 
 // authRequiresCredential decides whether a user_config field is required.
-// api_key/bearer_token/oauth2 gate every API call on the credential.
+// api_key/bearer_token/oauth2/oauth2_refresh gate every API call on the credential.
 // cookie/composed flows have unauth fallbacks for some tools, so we let
 // the user skip and hit the parts that work without credentials.
 func authRequiresCredential(authType string) bool {
 	switch authType {
-	case authTypeAPIKey, authTypeBearerToken, authTypeOAuth2:
+	case authTypeAPIKey, authTypeBearerToken, authTypeOAuth2, authTypeOAuth2Refresh:
 		return true
 	default:
 		return false

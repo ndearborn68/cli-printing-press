@@ -1,5 +1,7 @@
 # {{.ProseName}} CLI
 {{- $canonicalEnvVar := .Auth.CanonicalEnvVar}}
+{{- $deviceEnvVars := deviceCodeEnvVars .Auth}}
+{{- $authPersistenceCommand := authCredentialPersistenceCommand .Auth .Name}}
 {{- if and .Narrative .Narrative.Headline}}
 
 **{{.Narrative.Headline}}**
@@ -15,29 +17,44 @@
 
 Learn more at [{{.ProseName}}]({{.WebsiteURL}}).
 {{- end}}
-{{- if .Printer}}
+{{- if .Creator.Handle}}
 
-Printed by [@{{.Printer}}](https://github.com/{{.Printer}}){{if .PrinterName}} ({{.PrinterName}}){{end}}.
+Created by [@{{.Creator.Handle}}](https://github.com/{{.Creator.Handle}}){{if .Creator.Name}} ({{.Creator.Name}}){{end}}.
+{{- if .Contributors}}
+Contributors: {{range $i, $c := .Contributors}}{{if $i}}, {{end}}{{if $c.Handle}}[@{{$c.Handle}}](https://github.com/{{$c.Handle}}){{if $c.Name}} ({{$c.Name}}){{end}}{{else}}{{$c.Name}}{{end}}{{end}}.
+{{- end}}
 {{- end}}
 
 ## Install
 
-The recommended path installs both the `{{.Name}}-pp-cli` binary and the `pp-{{.Name}}` agent skill in one shot:
+The recommended path installs both the `{{.Name}}-pp-cli` binary and the `pp-{{.Name}}` agent skill (Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot, and other agents supported by the upstream [`skills`](https://github.com/vercel-labs/skills) CLI) in one shot:
 
 ```bash
-npx -y @mvanhorn/printing-press install {{.Name}}
+npx -y @mvanhorn/printing-press-library install {{.Name}}
 ```
 
 For CLI only (no skill):
 
 ```bash
-npx -y @mvanhorn/printing-press install {{.Name}} --cli-only
+npx -y @mvanhorn/printing-press-library install {{.Name}} --cli-only
 ```
 
+For skill only — installs the skill into the same agents as the default command above, but skips the CLI binary (use this to update or reinstall just the skill):
+
+```bash
+npx -y @mvanhorn/printing-press-library install {{.Name}} --skill-only
+```
+
+To constrain the skill install to one or more specific agents (repeatable — agent names match the [`skills`](https://github.com/vercel-labs/skills) CLI):
+
+```bash
+npx -y @mvanhorn/printing-press-library install {{.Name}} --agent claude-code
+npx -y @mvanhorn/printing-press-library install {{.Name}} --agent claude-code --agent codex
+```
 {{ if .Category}}
 ### Without Node (Go fallback)
 
-If `npx` isn't available (no Node, offline), install the CLI directly via Go (requires Go 1.26.3 or newer):
+If `npx` isn't available (no Node, offline), install the CLI directly via Go (requires Go 1.26.10 or newer):
 
 ```bash
 go install github.com/mvanhorn/printing-press-library/library/{{.Category}}/{{.Name}}/cmd/{{.Name}}-pp-cli@latest
@@ -57,6 +74,14 @@ Download a pre-built binary for your platform from the [latest release](https://
 <!-- pp-hermes-install-anchor -->
 ## Install for Hermes
 
+Install the CLI binary first. The installer writes binaries to a per-user managed bin directory by default: `$HOME/.local/bin` on macOS/Linux and `%LOCALAPPDATA%\Programs\PrintingPress\bin` on Windows.
+
+```bash
+npx -y @mvanhorn/printing-press-library install {{.Name}} --cli-only
+```
+
+Then install the focused Hermes skill.
+
 From the Hermes CLI:
 
 ```bash
@@ -69,13 +94,126 @@ Inside a Hermes chat session:
 /skills install mvanhorn/printing-press-library/cli-skills/pp-{{.Name}} --force
 ```
 
+Restart the Hermes session or gateway if the newly installed skill is not visible immediately.
+
 ## Install for OpenClaw
+Install both the CLI binary and the focused OpenClaw skill. The installer defaults binaries to a per-user bin directory (`$HOME/.local/bin` on macOS/Linux, `%LOCALAPPDATA%\Programs\PrintingPress\bin` on Windows):
 
-Tell your OpenClaw agent (copy this):
+```bash
+npx -y @mvanhorn/printing-press-library install {{.Name}} --agent openclaw
+```
 
+Restart the OpenClaw session or gateway if the newly installed skill is not visible immediately.
+
+## Use with Claude Desktop
+
+This CLI ships an [MCPB](https://github.com/modelcontextprotocol/mcpb) bundle — Claude Desktop's standard format for one-click MCP extension installs (no JSON config required).
+{{- if or (eq .Auth.Type "cookie") (eq .Auth.Type "composed")}}
+
+The bundle reuses your local browser session — set it up first if you haven't:
+
+```bash
+{{.Name}}-pp-cli auth login --chrome
 ```
-Install the pp-{{.Name}} skill from https://github.com/mvanhorn/printing-press-library/tree/main/cli-skills/pp-{{.Name}}. The skill defines how its required CLI can be installed.
+{{- else if eq .Auth.EffectiveOAuth2Grant "device_code"}}
+
+The bundle reuses your local OAuth tokens — authenticate first if you haven't:
+
+```bash
+{{- if or .Auth.DefaultClientID (not $deviceEnvVars)}}
+{{.Name}}-pp-cli auth login --device-code
+{{- else}}
+export {{(index $deviceEnvVars 0).Name}}=<client-id>
+{{.Name}}-pp-cli auth login --device-code
+{{- end}}
 ```
+{{- else if and (eq .Auth.Type "oauth2") authLoginCommandAvailable}}
+
+The bundle reuses your local OAuth tokens — authenticate first if you haven't:
+
+```bash
+{{.Name}}-pp-cli auth login
+```
+{{- else if and (eq .Auth.Type "oauth2") authSetupCommandAvailable}}
+
+The bundle needs credentials — set them up first if you haven't:
+
+```bash
+{{.Name}}-pp-cli auth setup
+```
+{{- else if eq .Auth.Type "oauth2_refresh"}}
+
+The bundle reuses your local OAuth2 refresh-token credentials — configure them first if you haven't:
+
+```bash
+{{- range .Auth.EnvVarSpecs}}
+export {{.Name}}="{{authEnvPlaceholder .}}"
+{{- end}}
+```
+{{- else if and (eq .Auth.Type "bearer_token") (not $canonicalEnvVar) $authPersistenceCommand}}
+
+Store your token first if you haven't:
+
+```bash
+{{$authPersistenceCommand}}
+```
+{{- end}}
+
+To install:
+
+1. Download the `.mcpb` for your platform from the [latest release](https://github.com/mvanhorn/printing-press-library/releases/tag/{{.Name}}-current).
+2. Double-click the `.mcpb` file. Claude Desktop opens and walks you through the install.
+{{- if and $canonicalEnvVar (ne .Auth.Type "none") (ne .Auth.Type "cookie") (ne .Auth.Type "composed")}}
+3. Fill in `{{$canonicalEnvVar.Name}}` when Claude Desktop prompts you.
+{{- end}}
+
+Requires Claude Desktop 1.0.0 or later. Pre-built bundles ship for macOS Apple Silicon (`darwin-arm64`) and Windows (`amd64`, `arm64`); for other platforms, use the manual config below.
+
+<details>
+<summary>Manual JSON config (advanced)</summary>
+
+If you can't use the MCPB bundle (older Claude Desktop, unsupported platform), install the MCP binary and configure it manually.
+
+{{ if .Category}}
+```bash
+go install github.com/mvanhorn/printing-press-library/library/{{.Category}}/{{.Name}}/cmd/{{.Name}}-pp-mcp@latest
+```
+{{- else}}
+Install the MCP binary from this CLI's published public-library entry or pre-built release.
+{{- end}}
+
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```json
+{
+  "mcpServers": {
+    "{{.Name}}": {
+      "command": "{{.Name}}-pp-mcp"{{- if and $canonicalEnvVar (ne .Auth.Type "none") (ne .Auth.Type "cookie") (ne .Auth.Type "composed")}},
+      "env": {
+{{- range .EndpointTemplateVars}}
+        "{{envName $.Name}}_{{upper .}}": "{{if eq . "shop"}}<your-store>.myshopify.com{{else if eq . "api_version"}}{{$.Version}}{{else}}<{{.}}>{{end}}",
+{{- end}}
+        "{{$canonicalEnvVar.Name}}": "<your-key>"
+      }{{- end}}
+    }
+  }
+}
+```
+
+</details>
+{{- if .HasMCPTransport "http"}}
+
+### Remote MCP over HTTP
+
+`{{.Name}}-pp-mcp --transport http` (or `PP_MCP_TRANSPORT=http`) serves streamable HTTP at `http://{{if .MCP.Addr}}{{.MCP.Addr}}{{else}}127.0.0.1:7777{{end}}/mcp`. It refuses to start until `{{envName .Name}}_MCP_HTTP_TOKEN` is set to at least 32 characters, and every request must send `Authorization: Bearer <token>`. The command below prints 64 hex characters and meets that minimum. Plain HTTP is allowed only on a loopback `--addr`; any other bind, including `:7777` (every interface), also needs `--tls-cert` and `--tls-key`. Requests with no `Origin` header are accepted, as are loopback origins (`localhost`, `127.0.0.1`, or `[::1]`, any port). Any other `Origin` is refused unless it is listed in `{{envName .Name}}_MCP_HTTP_ALLOWED_ORIGINS`, a comma-separated list of `scheme://host[:port]` values with no path. That list is not a CORS policy; the server does not emit CORS headers.
+
+```bash
+export {{envName .Name}}_MCP_HTTP_TOKEN="$(openssl rand -hex 32)"
+{{.Name}}-pp-mcp --transport http
+```
+
+Set `{{envName .Name}}_MCP_READ_ONLY=1` (exactly `1`) to drop mirrored commands that are not marked read-only and make the raw execute tool refuse state-changing calls. Commands marked local-write, which write only this CLI's own learn store, stay available.
+{{- end}}
 {{- if and .Narrative .Narrative.AuthNarrative}}
 
 {{if .Auth.Optional}}## Optional: API Key{{else}}## Authentication{{end}}
@@ -113,7 +251,7 @@ Set the endpoint variables for the tenant, workspace, or API version you want th
 
 ```bash
 {{- range .EndpointTemplateVars}}
-export {{envName $.Name}}_{{upper .}}="{{if eq . "shop"}}<your-store>.myshopify.com{{else if eq . "api_version"}}{{$.Version}}{{else}}<{{.}}>{{end}}"
+export {{endpointTemplateEnvName .}}="{{if eq . "shop"}}<your-store>.myshopify.com{{else if eq . "api_version"}}{{$.Version}}{{else}}<{{.}}>{{end}}"
 {{- end}}
 ```
 {{- end}}
@@ -125,12 +263,31 @@ Get your API key from your API provider's developer portal. The key typically lo
 export {{.Name}}="<paste-your-key>"
 ```
 
-You can also persist this in your config file at `{{$.Config.Path}}`.
+{{- if $authPersistenceCommand}}
+To persist credentials, use `{{$authPersistenceCommand}}`. Stored secrets live in `credentials.toml` under the data directory, not in `config.toml`.
 {{- end}}
+{{- end}}
+{{- else if eq .Auth.EffectiveOAuth2Grant "device_code"}}
+
+### 2. Authenticate
+
+Authorize with the OAuth2 device-code flow:
+
+```bash
+{{- if or .Auth.DefaultClientID (not $deviceEnvVars)}}
+{{.Name}}-pp-cli auth login --device-code
+{{- else}}
+export {{(index $deviceEnvVars 0).Name}}=<client-id>
+{{.Name}}-pp-cli auth login --device-code
+{{- end}}
+```
+
+Open the verification URL, enter the printed user code, and return to the CLI. Your tokens are stored locally and refreshed automatically.
 {{- else if eq .Auth.Type "oauth2"}}
 
 ### 2. Authenticate
 
+{{- if authLoginCommandAvailable}}
 Authorize via your browser:
 
 ```bash
@@ -138,15 +295,39 @@ Authorize via your browser:
 ```
 
 This opens a browser window to complete the OAuth2 flow. Your tokens are stored locally and refreshed automatically.
+{{- else if authSetupCommandAvailable}}
+Run `{{.Name}}-pp-cli auth setup` for credential setup steps.
+{{- end}}
+{{- if authCodeSetTokenAvailable .Auth}}
+
+To store a bearer you already hold, pipe it on stdin so it does not land in shell history:
+
+```bash
+echo "$TOKEN" | {{.Name}}-pp-cli auth set-token
+```
+{{- end}}
+{{- else if eq .Auth.Type "oauth2_refresh"}}
+
+### 2. Set Up OAuth2 Refresh Credentials
+
+This CLI uses OAuth2 with refresh-token rotation. Provide the client credentials and refresh token; access tokens are refreshed automatically.
+
+```bash
+{{- range .Auth.EnvVarSpecs}}
+export {{.Name}}="{{authEnvPlaceholder .}}"
+{{- end}}
+```
 {{- else if eq .Auth.Type "bearer_token"}}
 
 ### 2. Set Up Credentials
 
-Get your access token from your API provider's developer portal, then store it:
+Get your access token from your API provider's developer portal{{if $authPersistenceCommand}}, then store it{{end}}:
+{{- if $authPersistenceCommand}}
 
 ```bash
-{{.Name}}-pp-cli auth set-token YOUR_TOKEN_HERE
+{{$authPersistenceCommand}}
 ```
+{{- end}}
 {{- if .BearerRefresh.Enabled}}
 
 If commands start returning auth errors after working for a while, refresh the public client bearer token from the live web bundle:
@@ -174,7 +355,13 @@ This CLI uses your browser session for authentication. Log in to {{.Auth.CookieD
 {{.Name}}-pp-cli auth login --chrome
 ```
 
-Requires a cookie extraction tool. Install one:
+Or import an existing browser capture:
+
+```bash
+{{.Name}}-pp-cli auth login --cookies-file storage-state.json
+```
+
+`--cookies-file` accepts Playwright storage-state JSON or a raw `Cookie:` header text file. The Chrome path requires a cookie extraction tool. Install one:
 
 ```bash
 pip install pycookiecheat          # Python (recommended)
@@ -182,6 +369,15 @@ brew install barnardb/cookies/cookies  # Homebrew
 ```
 
 When your session expires, run `auth login --chrome` again.
+{{- else if eq .Auth.Type "session_handshake"}}
+
+### 2. Authenticate
+
+This CLI uses a browser-backed session handshake. Import browser cookies from Playwright storage-state JSON or a raw `Cookie:` header text file:
+
+```bash
+{{.Name}}-pp-cli auth login --cookies-file storage-state.json
+```
 {{- end}}
 
 ### {{if and (ne .Auth.Type "") (ne .Auth.Type "none")}}3{{else}}2{{end}}. Verify Setup
@@ -206,13 +402,15 @@ This checks your configuration{{if and (ne .Auth.Type "") (ne .Auth.Type "none")
 
 ## Unique Features
 
-These capabilities aren't available in any other tool for this API.
+{{if not .HasListedAlternatives}}{{novelExclusivityClaim}}{{end}}
 {{- $groups := groupNovelFeatures .NovelFeatures}}
 {{- if $groups}}
-{{- range $groups}}
+{{- range $i, $g := $groups}}
+{{- if or (gt $i 0) (not $.HasListedAlternatives)}}
 
-### {{.Name}}
-{{range .Features}}
+{{end -}}
+### {{$g.Name}}
+{{range $g.Features}}
 - **`{{.Command}}`** — {{.Description}}
 {{- if .WhyItMatters}}
 
@@ -242,10 +440,102 @@ These capabilities aren't available in any other tool for this API.
 {{- end}}
 {{- end}}
 {{- end}}
+{{- if and .Narrative .Narrative.Recipes}}
+
+## Recipes
+{{range .Narrative.Recipes}}
+
+### {{.Title}}
+
+```bash
+{{.Command}}
+```
+{{- if .Explanation}}
+
+{{.Explanation}}
+{{- end}}
+{{- end}}
+{{- end}}
 
 ## Usage
 
 Run `{{.Name}}-pp-cli --help` for the full command reference and flag list.
+
+## Paths & environment variables
+
+This CLI separates local files into four path kinds:
+
+| Kind | Contents |
+|------|----------|
+| `config` | User-editable settings such as `config.toml` and saved profiles |
+| `data` | Durable local data{{if .HasAuthCommand}}: `credentials.toml`, `data.db`, cookies, browser-session proof files, and other auth sidecars{{else}} such as `data.db`{{end}} |
+| `state` | Runtime state such as persisted queries, jobs, and `teach.log` |
+| `cache` | Regenerable HTTP/cache files |
+
+Each kind resolves independently. The ladder is:
+
+1. Per-kind env var: `{{envName .Name}}_CONFIG_DIR`, `{{envName .Name}}_DATA_DIR`, `{{envName .Name}}_STATE_DIR`, or `{{envName .Name}}_CACHE_DIR`
+2. `--home <dir>` for this invocation
+3. `{{envName .Name}}_HOME` for a flat relocated root
+4. XDG env vars: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`
+5. Platform defaults matching existing installs
+
+For containers and agent sandboxes, prefer a single relocated root:
+
+```bash
+export {{envName .Name}}_HOME=/srv/{{.Name}}
+{{.Name}}-pp-cli doctor
+```
+
+Under `{{envName .Name}}_HOME=/srv/{{.Name}}`, the four dirs resolve to `/srv/{{.Name}}/config`, `/srv/{{.Name}}/data`, `/srv/{{.Name}}/state`, and `/srv/{{.Name}}/cache`.
+
+On Windows, set the same variable in PowerShell:
+
+```powershell
+$env:{{envName .Name}}_HOME = "C:\srv\{{.Name}}"
+{{.Name}}-pp-cli doctor
+```
+
+Under `$env:{{envName .Name}}_HOME = "C:\srv\{{.Name}}"`, the four dirs resolve to `C:\srv\{{.Name}}\config`, `C:\srv\{{.Name}}\data`, `C:\srv\{{.Name}}\state`, and `C:\srv\{{.Name}}\cache`.
+
+MCP servers do not receive CLI flags from the host. Put relocation in the host `env` block:
+
+```json
+{
+  "mcpServers": {
+    "{{.Name}}": {
+      "command": "{{.Name}}-pp-mcp",
+      "env": {
+        "{{envName .Name}}_HOME": "/srv/{{.Name}}"
+      }
+    }
+  }
+}
+```
+
+Precedence matters in fleets: an ambient per-kind variable such as `{{envName .Name}}_DATA_DIR` overrides an explicit `--home` for that kind. Use `{{envName .Name}}_HOME` or the per-kind variables for durable fleet relocation; treat `--home` as the weaker per-invocation lever.
+
+Relocation is one-way. Unsetting `{{envName .Name}}_HOME` does not move files back to platform defaults, and `doctor` cannot find {{if .HasAuthCommand}}credentials{{else}}files{{end}} left under a former root. Move the files manually before unsetting relocation variables.
+
+{{if .HasAuthCommand -}}
+Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `{{.Name}}-pp-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
+{{- else -}}
+Existing installs keep working because the platform-default rung matches the legacy layout. Run `{{.Name}}-pp-cli doctor --fail-on warn` to check path warnings in automation.
+{{- end}}
+
+### Local data
+
+{{if .HasDataLayer -}}
+Reads are saved locally by default: in `--data-source auto` mode every successful read is also written to the SQLite store (`data.db`, or `data-<hash>.db` per credential) in the data directory. {{end -}}
+GET responses are cached for five minutes under `http/` in the cache directory.{{if .HasAuthCommand}} Credentials live in `credentials.toml` in the data directory.{{end}}{{if .Learn.Enabled}} The learn journal lives under `learn/` in the state directory.{{end}} `{{.Name}}-pp-cli doctor` prints the resolved paths, every store file, and the response-cache size.
+
+None of it is encrypted. New files are created owner-only; beyond that the data relies on OS account permissions and full-disk encryption (FileVault, BitLocker, LUKS).
+
+- **Erase it:** `{{.Name}}-pp-cli local-data purge` lists the store files, response cache, and learn journal it would delete; add `--yes` to delete them, or `--only store|cache|journal` to narrow it. Config and credentials are kept.
+- **Run without a local copy:** set `{{envName .Name}}_NO_LOCAL_DATA=1`. Reads go to the API{{if .HasDataLayer}} (`--data-source live`; `--data-source local` still reads an existing store){{end}}, the response cache is off (`--no-cache`), nothing new is written to the store, and `sync`{{if .HasDataLayer}} and `workflow archive`{{end}} refuse to run. Set it in an MCP host's `env` block and every command the server runs inherits it.
+{{- if .HasDataLayer}}
+- **Choose the read source without flags:** `{{envName .Name}}_DATA_SOURCE=auto|live|local` sets the `--data-source` default; an explicit flag wins.
+{{- end}}
 
 ## Commands
 {{range $name, $resource := .Resources}}
@@ -253,9 +543,41 @@ Run `{{.Name}}-pp-cli --help` for the full command reference and flag list.
 
 {{$resource.Description}}
 {{range $eName, $endpoint := $resource.Endpoints}}
-- **`{{$.Name}}-pp-cli {{$name}} {{$eName}}`** - {{$endpoint.Description}}
+{{- if index $.PromotedResourceNames $name}}
+- **`{{$.Name}}-pp-cli {{kebab $name}}{{positionalArgs $endpoint}}`** - {{$endpoint.Description}}
+{{- else}}
+- **`{{$.Name}}-pp-cli {{kebab $name}} {{kebab $eName}}`** - {{$endpoint.Description}}
+{{- end}}
 {{- end}}
 {{end}}
+{{- if .AdditionalCommandGroups}}
+{{range .AdditionalCommandGroups}}
+### {{.Heading}}
+
+{{range .Commands}}
+- **`{{$.Name}}-pp-cli {{.Invocation}}`** - {{.Description}}
+{{end}}
+{{end}}
+{{end}}
+{{- if .Learn.Enabled}}
+
+### Self-learning loop
+
+This CLI caches per-question discovery so repeat queries skip the walk and structurally similar queries get answered via entity substitution. The loop also self-captures: every invocation is journaled locally, and failed-flag corrections plus fresh teaches surface as candidates on the next `recall` for confirm/reject judgment. Agents call `recall` before discovery and fire `teach &` after answering. See the `## Automatic learning` section in `SKILL.md` for the full protocol.
+
+- **`{{$.Name}}-pp-cli recall <query>`** - Look up cached resources for a query before running discovery
+- **`{{$.Name}}-pp-cli teach`** - Record a query -> resource mapping (silent on success, safe to background with `&`)
+- **`{{$.Name}}-pp-cli learnings list`** - Inspect taught rows
+- **`{{$.Name}}-pp-cli learnings forget <query>`** - Undo a teach
+- **`{{$.Name}}-pp-cli learnings candidates`** - List auto-captured candidates awaiting confirm/reject
+- **`{{$.Name}}-pp-cli learnings stats`** - Local loop metrics: recall hit rate, teach-to-reuse, playbook resolution, candidate counts
+- **`{{$.Name}}-pp-cli teach-pattern`** - Install a query/resource template up front
+- **`{{$.Name}}-pp-cli teach-lookup`** - Add an entity mapping (e.g. country code, team alias) for pattern substitution
+
+Pass `--no-learn` or set `{{envPrefix .Name}}_NO_LEARN=true` to disable the loop for deterministic flows.
+
+The local store's schema version stamp is one-way: once this version of `{{$.Name}}-pp-cli` opens the database, older binaries refuse it with a version error — upgrade the binary rather than downgrading.
+{{- end}}
 
 ## Output Formats
 {{- $example := firstCommandExample .Resources}}
@@ -268,8 +590,13 @@ Run `{{.Name}}-pp-cli --help` for the full command reference and flag list.
 # JSON for scripting and agents
 {{.Name}}-pp-cli {{$example}} --json
 
+{{- if .SelectExample}}
 # Filter to specific fields
-{{.Name}}-pp-cli {{$example}} --json --select id,name,status
+{{.Name}}-pp-cli {{$example}} --json --select {{.SelectExample}}
+{{- else}}
+# Filter to specific fields by name
+{{.Name}}-pp-cli {{$example}} --json --select <field>[,<field>...]
+{{- end}}
 
 # Dry run — show the request without sending
 {{.Name}}-pp-cli {{$example}} --dry-run
@@ -282,10 +609,15 @@ Run `{{.Name}}-pp-cli --help` for the full command reference and flag list.
 Every command supports these output flags:
 
 - `--json` — structured output for scripting and agents
-- `--select id,name,status` — filter to specific fields
+- `--compact` — keep identity, status, and timestamp fields
+- `--csv` / `--plain` — tabular rows (collection envelopes unwrap)
+- `--quiet` — one identity value per line
+- `--select <field>[,<field>...]` — filter to specific fields
 - `--dry-run` — preview the request without sending
 - `--agent` — JSON + compact + non-interactive in one flag
 {{- end}}
+
+`--csv` prefixes a leading `'` on cells and header keys that start with `=`, `+`, `-`, `@`, a tab, or a line break (including fullwidth `＝＋－＠`) so a spreadsheet does not run them as formulas. Plain signed numbers such as `-5` and `+2.5e3` are left unchanged.
 
 ## Agent Usage
 
@@ -293,11 +625,13 @@ This CLI is designed for AI agent consumption:
 
 - **Non-interactive** - never prompts, every input is a flag
 - **Pipeable** - `--json` output to stdout, errors to stderr
-- **Filterable** - `--select id,name` returns only fields you need
+- **Filterable** - `--select <field>[,<field>...]` returns only fields you need
 - **Previewable** - `--dry-run` shows the request without sending
 {{- if .HasWriteCommands}}
-- **Explicit retries** - add `--idempotent` to create retries{{if .HasDelete}} and `--ignore-missing` to delete retries{{end}} when a no-op success is acceptable
-- **Confirmable** - `--yes` for explicit confirmation of destructive actions
+{{- if or .HasCreateCommands .HasDelete}}
+- **Explicit retries** - {{if .HasCreateCommands}}add `--idempotent` to create retries{{if .HasDelete}} and {{end}}{{end}}{{if .HasDelete}}add `--ignore-missing` to delete retries{{end}} when a no-op success is acceptable
+{{- end}}
+- **Explicit confirmation** - `--agent` does not imply `--yes`; pass `--yes` separately only after the target, arguments, and side effects are clear
 - **Piped input** - write commands can accept structured input when their help lists `--stdin`
 {{- else}}
 - **Read-only by default** - this CLI does not create, update, delete, publish, send, or mutate remote resources
@@ -307,8 +641,8 @@ This CLI is designed for AI agent consumption:
 {{- end}}
 - **Agent-safe by default** - no colors or formatting unless `--human-friendly` is set
 
-Exit codes: `0` success, `2` usage error, `3` not found{{if .HasAuth}}, `4` auth error{{end}}, `5` API error, `7` rate limited, `10` config error.
-{{- if and .HasDataLayer .Cache.Enabled}}
+Exit codes: `0` success, `2` usage error, `3` not found{{if .HasAuth}}, `4` auth error{{end}}, `5` API error{{if .HasPartialFailureErr}}, `6` partial failure{{end}}, `7` rate limited{{if not .HasAuth}} or blocked{{end}}{{if .HasAsyncJobs}}, `8` async job submitted but not finished (rerun the printed recovery command; do not resubmit){{end}}, `10` config error.
+{{- if and .HasDataLayer .HasAutoRefresh}}
 
 ## Freshness
 
@@ -333,7 +667,7 @@ This CLI resolves endpoint placeholders at runtime, so one installed binary can 
 
 Endpoint environment variables:
 {{- range .EndpointTemplateVars}}
-- `{{envName $.Name}}_{{upper .}}` resolves `{ {{- . -}} }`
+- `{{endpointTemplateEnvName .}}` resolves `{ {{- . -}} }`
 {{- end}}
 
 Base URL: `{{.BaseURL}}`
@@ -342,142 +676,6 @@ Base URL: `{{.BaseURL}}`
 GraphQL path: `{{.GraphQLEndpointPath}}`
 {{- end}}
 {{- end}}
-
-## Use with Claude Code
-
-Install the focused skill — it auto-installs the CLI on first invocation:
-
-```bash
-npx skills add mvanhorn/printing-press-library/cli-skills/pp-{{.Name}} -g
-```
-
-Then invoke `/pp-{{.Name}} <query>` in Claude Code. The skill is the most efficient path — Claude Code drives the CLI directly without an MCP server in the middle.
-
-<details>
-<summary>Use as an MCP server in Claude Code (advanced)</summary>
-
-If you'd rather register this CLI as an MCP server in Claude Code, install the MCP binary first:
-
-{{ if .Category}}
-```bash
-go install github.com/mvanhorn/printing-press-library/library/{{.Category}}/{{.Name}}/cmd/{{.Name}}-pp-mcp@latest
-```
-{{- else}}
-Install the MCP binary from this CLI's published public-library entry or pre-built release.
-{{- end}}
-
-Then register it:
-{{- if and (eq .Auth.Type "api_key") $canonicalEnvVar}}
-
-```bash
-claude mcp add {{.Name}} {{.Name}}-pp-mcp{{range .EndpointTemplateVars}} -e {{envName $.Name}}_{{upper .}}={{if eq . "shop"}}<your-store>.myshopify.com{{else if eq . "api_version"}}{{$.Version}}{{else}}<{{.}}>{{end}}{{end}} -e {{$canonicalEnvVar.Name}}=<your-key>
-```
-{{- else if or (eq .Auth.Type "cookie") (eq .Auth.Type "composed")}}
-
-```bash
-# Some tools work without auth. For full access, set up auth first:
-{{.Name}}-pp-cli auth login --chrome
-
-claude mcp add {{.Name}} {{.Name}}-pp-mcp
-```
-{{- else if eq .Auth.Type "oauth2"}}
-
-```bash
-# Set up auth first:
-{{.Name}}-pp-cli auth login
-
-claude mcp add {{.Name}} {{.Name}}-pp-mcp
-```
-{{- else if and (eq .Auth.Type "bearer_token") $canonicalEnvVar}}
-
-```bash
-claude mcp add {{.Name}} {{.Name}}-pp-mcp -e {{$canonicalEnvVar.Name}}=<your-token>
-```
-{{- else if eq .Auth.Type "bearer_token"}}
-
-```bash
-# Set up auth first:
-{{.Name}}-pp-cli auth set-token YOUR_TOKEN_HERE
-
-claude mcp add {{.Name}} {{.Name}}-pp-mcp
-```
-{{- else}}
-
-```bash
-claude mcp add {{.Name}} {{.Name}}-pp-mcp
-```
-{{- end}}
-
-</details>
-
-## Use with Claude Desktop
-
-This CLI ships an [MCPB](https://github.com/modelcontextprotocol/mcpb) bundle — Claude Desktop's standard format for one-click MCP extension installs (no JSON config required).
-{{- if or (eq .Auth.Type "cookie") (eq .Auth.Type "composed")}}
-
-The bundle reuses your local browser session — set it up first if you haven't:
-
-```bash
-{{.Name}}-pp-cli auth login --chrome
-```
-{{- else if eq .Auth.Type "oauth2"}}
-
-The bundle reuses your local OAuth tokens — authenticate first if you haven't:
-
-```bash
-{{.Name}}-pp-cli auth login
-```
-{{- else if and (eq .Auth.Type "bearer_token") (not $canonicalEnvVar)}}
-
-Store your token first if you haven't:
-
-```bash
-{{.Name}}-pp-cli auth set-token YOUR_TOKEN_HERE
-```
-{{- end}}
-
-To install:
-
-1. Download the `.mcpb` for your platform from the [latest release](https://github.com/mvanhorn/printing-press-library/releases/tag/{{.Name}}-current).
-2. Double-click the `.mcpb` file. Claude Desktop opens and walks you through the install.
-{{- if and $canonicalEnvVar (ne .Auth.Type "none") (ne .Auth.Type "cookie") (ne .Auth.Type "composed")}}
-3. Fill in `{{$canonicalEnvVar.Name}}` when Claude Desktop prompts you.
-{{- end}}
-
-Requires Claude Desktop 1.0.0 or later. Pre-built bundles ship for macOS Apple Silicon (`darwin-arm64`) and Windows (`amd64`, `arm64`); for other platforms, use the manual config below.
-
-<details>
-<summary>Manual JSON config (advanced)</summary>
-
-If you can't use the MCPB bundle (older Claude Desktop, unsupported platform), install the MCP binary and configure it manually.
-
-{{ if .Category}}
-```bash
-go install github.com/mvanhorn/printing-press-library/library/{{.Category}}/{{.Name}}/cmd/{{.Name}}-pp-mcp@latest
-```
-{{- else}}
-Install the MCP binary from this CLI's published public-library entry or pre-built release.
-{{- end}}
-
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "{{.Name}}": {
-      "command": "{{.Name}}-pp-mcp"{{- if and $canonicalEnvVar (ne .Auth.Type "none") (ne .Auth.Type "cookie") (ne .Auth.Type "composed")}},
-      "env": {
-{{- range .EndpointTemplateVars}}
-        "{{envName $.Name}}_{{upper .}}": "{{if eq . "shop"}}<your-store>.myshopify.com{{else if eq . "api_version"}}{{$.Version}}{{else}}<{{.}}>{{end}}",
-{{- end}}
-        "{{$canonicalEnvVar.Name}}": "<your-key>"
-      }{{- end}}
-    }
-  }
-}
-```
-
-</details>
 
 ## Health Check
 
@@ -489,9 +687,12 @@ Verifies configuration{{if and (ne .Auth.Type "") (ne .Auth.Type "none")}}, cred
 
 ## Configuration
 
-Config file: `{{.Config.Path}}`
+{{/* Windows form matches cliutil defaultBase: os.UserHomeDir (USERPROFILE) joined with .config\<name>-pp-cli, not %APPDATA%. */ -}}
+Run `{{.Name}}-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `{{.Config.Path}}` on macOS/Linux and `%USERPROFILE%\.config\{{.Name}}-pp-cli\config.{{or .Config.Format "json"}}` on Windows; `--home`, `{{envName .Name}}_HOME`, and per-kind env vars can relocate it.
 
 Static request headers can be configured under `headers`; per-command header overrides take precedence.
+
+`--ca-cert`, `{{envPrefix .Name}}_CA_CERT`, or `ca_cert` adds a PEM CA bundle to the system trust roots. `--tls-server-name`, `{{envPrefix .Name}}_TLS_SERVER_NAME`, or `tls_server_name` is the name checked against the certificate when the dialed address does not match it. Precedence is flag, then environment, then the config file. A config file other users can change does not supply these settings. Certificate verification failures are not retried.
 {{- if or .Auth.EnvVarSpecs .Auth.EnvVars}}
 
 Environment variables:
@@ -510,6 +711,12 @@ Environment variables:
 | `{{.}}` | per_call | Yes |  |
 {{- end}}
 {{- end}}
+{{- end}}
+{{- if hasNonCookieAuth .Auth}}
+
+### agentcookie (optional)
+
+If you use agentcookie to sync secrets across machines, this CLI auto-adopts agentcookie-managed credentials with no extra setup. When the daemon writes to this CLI's config, `{{.Name}}-pp-cli doctor` reports `agentcookie: detected` and `auth-status` labels the source as `agentcookie`. Skip this section if you don't use agentcookie - the CLI works the same as any other.
 {{- end}}
 
 ## Troubleshooting
@@ -545,6 +752,8 @@ This CLI uses standard HTTP transport with HTTP/2 disabled for browser-facing en
 ## HTTP Transport
 
 This CLI uses Chrome-compatible HTTP transport{{if .UsesBrowserHTTP3Transport}} over HTTP/3{{end}} for browser-facing endpoints. It does not require a resident browser process for normal API calls.
+
+TLS certificates are verified by default. For a trusted development or self-signed endpoint only, pass `--insecure` for one invocation, set `{{envPrefix .Name}}_SKIP_TLS_VERIFY=true` for the current environment, or set `skip_tls_verify = true` in the config file for a persistent override. `--insecure` overrides `--ca-cert` and `--tls-server-name`.
 {{- end}}
 {{- if .TrafficAnalysis}}
 
